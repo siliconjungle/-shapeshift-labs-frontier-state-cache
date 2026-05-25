@@ -1,5 +1,5 @@
 import { cloneJson } from '@shapeshift-labs/frontier/clone';
-import { OP_SET } from '@shapeshift-labs/frontier/constants';
+import { OP_ARRAY_ASSIGN, OP_ARRAY_OBJECT_FIELD_ASSIGN, OP_SET } from '@shapeshift-labs/frontier/constants';
 import { diff } from '@shapeshift-labs/frontier/diff';
 import { equalsJsonFast } from '@shapeshift-labs/frontier/equal';
 import { hashQueryKey, identifyQueryEntity, partialMatchQueryKey } from '@shapeshift-labs/frontier-query';
@@ -13,9 +13,14 @@ import type {
 import type { QueryEntityIdentifyContext, QueryEntityInput } from '@shapeshift-labs/frontier-query';
 
 const REF_KEY = '\u0000frontierRef';
+const REF_FIELDS_KEY = '\u0000frontierFields';
+const EMPTY_PATH: JsonPath = [];
+const OFFSET_PAGE_MERGE = Symbol('frontier.offsetPageMerge');
+const MEMORY_STORAGE_SAVE_OWNED = Symbol('frontier.memoryStorageSaveOwned');
+const QUERY_CACHE_EXTRACT_OWNED = Symbol('frontier.queryCacheExtractOwned');
 
 type QueryCacheScalarKey = string | number | boolean | null;
-type QueryCacheInternalRef = { [REF_KEY]: string };
+type QueryCacheInternalRef = { [REF_KEY]: string; [REF_FIELDS_KEY]?: string[] };
 type QueryCacheInternalArray = QueryCacheInternalValue[];
 type QueryCacheInternalObject = { [key: string]: QueryCacheInternalValue };
 type QueryCacheInternalValue =
@@ -23,6 +28,7 @@ type QueryCacheInternalValue =
   | QueryCacheInternalRef
   | QueryCacheInternalArray
   | QueryCacheInternalObject;
+type QueryCacheDependencyFields = readonly string[] | Set<string> | null;
 
 type QueryCacheEntry = {
   key: QueryCacheKey;
@@ -30,12 +36,26 @@ type QueryCacheEntry = {
   root: QueryCacheInternalValue;
   value: JsonValue;
   dependencies: Set<string>;
+  dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>;
   stale: boolean;
   updatedAt: number;
 };
 
 type QueryCachePendingPatch = {
   patch: Patch;
+};
+
+type OffsetPageMergeInfo = {
+  offset: number;
+  length: number;
+};
+
+type QueryCacheOwnedSnapshotStorage = {
+  [MEMORY_STORAGE_SAVE_OWNED]?: (snapshot: QueryCacheSnapshot) => void | Promise<void>;
+};
+
+type QueryCacheOwnedSnapshotSource = {
+  [QUERY_CACHE_EXTRACT_OWNED]?: () => QueryCacheSnapshot;
 };
 
 export type QueryCacheKey = JsonValue;
@@ -232,6 +252,14 @@ export interface UniqueListMergeOptions {
 export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   const typenameField = options.typenameField || '__typename';
   const idFields = options.idFields || ['id', '_id'];
+  const identifyOption = options.identify === undefined
+    ? undefined
+    : (value: JsonObject, context: QueryCacheIdentifyContext) => options.identify?.(value, context);
+  const identifyOptions = {
+    typenameField,
+    idFields,
+    identify: identifyOption
+  };
   const now = typeof options.now === 'function' ? options.now : Date.now;
   const entities = new Map<QueryCacheEntityId, QueryCacheInternalObject>();
   const queries = new Map<string, QueryCacheEntry>();
@@ -243,6 +271,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   const pendingQueries = new Map<string, QueryCachePendingPatch>();
   const pendingEntities = new Map<string, QueryCachePendingPatch>();
   const pendingEvents: QueryCacheEvent[] = [];
+  const trackIdentifyPath = typeof options.identify === 'function';
   let batchDepth = 0;
 
   function writeQuery(key: QueryCacheKey, data: JsonValue, writeOptions: QueryCacheWriteOptions = {}): Patch {
@@ -251,10 +280,24 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const incoming = writeOptions.merge
       ? writeOptions.merge(previous ? previous.value : undefined, data, { key, hash })
       : data;
+    const offsetMergeInfo = previous === undefined ? undefined : readOffsetPageMergeInfo(incoming);
+    if (offsetMergeInfo !== undefined) {
+      const offsetPatch = writeOffsetPageQuery(key, hash, previous, incoming, offsetMergeInfo, writeOptions);
+      if (offsetPatch !== undefined) return offsetPatch;
+    }
     const dependencies = new Set<QueryCacheEntityId>();
     const changedEntities = new Set<QueryCacheEntityId>();
-    const root = normalizeValue(incoming, dependencies, changedEntities, []);
-    collectReachableDependencies(root, dependencies, new Set());
+    const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>();
+    const dependencyFields = new Map<QueryCacheEntityId, QueryCacheDependencyFields>();
+    const root = normalizeValue(
+      incoming,
+      dependencies,
+      dependencyFields,
+      changedEntities,
+      changedEntityFields,
+      trackIdentifyPath ? [] : undefined
+    );
+    ensureDependencyFields(dependencyFields, dependencies);
     const value = denormalizeValue(root, new Set()) as JsonValue;
     const patch = previous === undefined
       ? rootSetPatch(value)
@@ -263,8 +306,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       key: cloneJson(key),
       hash,
       root,
-      value: cloneJson(value),
+      value,
       dependencies,
+      dependencyFields,
       stale: writeOptions.stale === true,
       updatedAt: writeOptions.updatedAt === undefined ? now() : writeOptions.updatedAt
     };
@@ -273,7 +317,85 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     if (patch.length !== 0) {
       queueQueryPatch(hash, patch);
     }
-    refreshDependentQueries(changedEntities, hash);
+    refreshDependentQueries(changedEntities, hash, changedEntityFields);
+    return clonePatch(patch);
+  }
+
+  function writeOffsetPageQuery(
+    key: QueryCacheKey,
+    hash: string,
+    previous: QueryCacheEntry,
+    mergedValue: JsonValue,
+    info: OffsetPageMergeInfo,
+    writeOptions: QueryCacheWriteOptions
+  ): Patch | undefined {
+    if (!Array.isArray(previous.root) || !Array.isArray(previous.value) || !Array.isArray(mergedValue)) return undefined;
+    if (mergedValue.length < info.offset + info.length) return undefined;
+    const root = previous.root.slice() as QueryCacheInternalArray;
+    const value = previous.value.slice() as JsonValue[];
+    const changedEntities = new Set<QueryCacheEntityId>();
+    const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>();
+    const pageDependencies = new Set<QueryCacheEntityId>();
+    const pageDependencyFields = new Map<QueryCacheEntityId, QueryCacheDependencyFields>();
+    const indexes: number[] = [];
+    const values: JsonValue[] = [];
+    const offset = info.offset;
+    let fillsEmptySlots = true;
+
+    for (let i = 0; i < info.length; i++) {
+      const index = offset + i;
+      if (previous.root[index] !== undefined) fillsEmptySlots = false;
+      const normalized = normalizeValue(
+        mergedValue[index],
+        pageDependencies,
+        pageDependencyFields,
+        changedEntities,
+        changedEntityFields,
+        trackIdentifyPath ? [index] : undefined
+      );
+      root[index] = normalized;
+      const nextValue = denormalizeValue(normalized, new Set()) as JsonValue;
+      if (!equalsJsonFast(value[index], nextValue)) {
+        indexes[indexes.length] = index;
+        values[values.length] = cloneJson(nextValue);
+      }
+      value[index] = nextValue;
+    }
+
+    let dependencies: Set<QueryCacheEntityId>;
+    let dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>;
+    if (indexes.length === 0 && changedEntities.size === 0) {
+      dependencies = previous.dependencies;
+      dependencyFields = previous.dependencyFields;
+    } else if (fillsEmptySlots) {
+      dependencies = new Set(previous.dependencies);
+      for (const id of pageDependencies) dependencies.add(id);
+      dependencyFields = cloneDependencyFields(previous.dependencyFields);
+      mergeDependencyFields(dependencyFields, pageDependencyFields);
+      ensureDependencyFields(dependencyFields, dependencies);
+    } else {
+      dependencies = new Set<QueryCacheEntityId>();
+      collectReachableDependencies(root, dependencies, new Set());
+      dependencyFields = collectDependencyFields(root);
+      ensureDependencyFields(dependencyFields, dependencies);
+    }
+    const patch: Patch = indexes.length === 0
+      ? []
+      : [[OP_ARRAY_ASSIGN, [], indexes, values] as PatchOperation];
+    const nextEntry: QueryCacheEntry = {
+      key: cloneJson(key),
+      hash,
+      root,
+      value: value as JsonValue,
+      dependencies,
+      dependencyFields,
+      stale: writeOptions.stale === true,
+      updatedAt: writeOptions.updatedAt === undefined ? now() : writeOptions.updatedAt
+    };
+    queries.set(hash, nextEntry);
+    updateQueryDependencyIndex(hash, previous.dependencies, dependencies);
+    if (patch.length !== 0) queueQueryPatch(hash, patch);
+    refreshDependentQueries(changedEntities, hash, changedEntityFields);
     return clonePatch(patch);
   }
 
@@ -330,14 +452,8 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     };
   }
 
-  function identify(input: QueryCacheEntityInput, path: JsonPath = []): QueryCacheEntityId | null {
-    return identifyQueryEntity(input, {
-      typenameField,
-      idFields,
-      identify: options.identify === undefined
-        ? undefined
-        : (value, context) => options.identify?.(value, context)
-    }, path);
+  function identify(input: QueryCacheEntityInput, path?: JsonPath): QueryCacheEntityId | null {
+    return identifyQueryEntity(input, identifyOptions, path || (trackIdentifyPath ? [] : EMPTY_PATH));
   }
 
   function getEntity(entity: QueryCacheEntityInput): JsonObject | undefined {
@@ -355,21 +471,31 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const id = identify(entity);
     if (id === null) throw new TypeError('modifyEntity could not identify entity');
     const previous = getEntity(id);
-    const next = updater(previous === undefined ? undefined : cloneJson(previous));
+    const next = updater(previous);
     if (next === undefined || next === null) return [];
     const previousRecord = entities.get(id);
     const dependencies = new Set<QueryCacheEntityId>();
     const changedEntities = new Set<QueryCacheEntityId>();
-    const normalized = normalizeObject(next, dependencies, changedEntities, []);
+    const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>();
+    const dependencyFields = new Map<QueryCacheEntityId, QueryCacheDependencyFields>();
+    const normalized = normalizeObject(
+      next,
+      dependencies,
+      dependencyFields,
+      changedEntities,
+      changedEntityFields,
+      trackIdentifyPath ? [] : undefined
+    );
     entities.set(id, normalized);
     changedEntities.add(id);
+    recordChangedEntityFields(changedEntityFields, id, collectChangedObjectFields(previousRecord, normalized));
     const previousValue = previousRecord === undefined
       ? undefined
       : denormalizeValue(previousRecord, new Set()) as JsonValue;
     const nextValue = denormalizeValue(normalized, new Set()) as JsonValue;
     const entityPatch = previousValue === undefined ? rootSetPatch(nextValue) : diff(previousValue, nextValue);
     if (entityPatch.length !== 0) queueEntityPatch(id, entityPatch);
-    refreshDependentQueries(changedEntities);
+    refreshDependentQueries(changedEntities, undefined, changedEntityFields);
     return clonePatch(entityPatch);
   }
 
@@ -456,6 +582,26 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     return { entities: entityOut, queries: queryOut };
   }
 
+  function extractOwnedSnapshot(): QueryCacheSnapshot {
+    const entityOut: Record<string, JsonObject> = {};
+    for (const [id, value] of entities) {
+      entityOut[id] = value as unknown as JsonObject;
+    }
+    const queryOut: QueryCacheSnapshotQuery[] = [];
+    for (const entry of queries.values()) {
+      queryOut[queryOut.length] = {
+        key: entry.key,
+        hash: entry.hash,
+        root: entry.root,
+        value: entry.value,
+        dependencies: Array.from(entry.dependencies).sort(),
+        stale: entry.stale,
+        updatedAt: entry.updatedAt
+      };
+    }
+    return { entities: entityOut, queries: queryOut };
+  }
+
   function restore(snapshot: QueryCacheSnapshot): void {
     batch(() => {
       const previousQueryValues = new Map<string, JsonValue>();
@@ -473,12 +619,16 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       for (let i = 0; i < snapshotQueries.length; i++) {
         const item = snapshotQueries[i];
         const dependencies = new Set<QueryCacheEntityId>(item.dependencies || []);
+        const root = cloneInternalValue(item.root);
+        const dependencyFields = collectDependencyFields(root);
+        ensureDependencyFields(dependencyFields, dependencies);
         queries.set(item.hash, {
           key: cloneJson(item.key),
           hash: item.hash,
-          root: cloneInternalValue(item.root),
+          root,
           value: cloneJson(item.value),
           dependencies,
+          dependencyFields,
           stale: item.stale === true,
           updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : now()
         });
@@ -513,38 +663,53 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   function normalizeValue(
     value: JsonValue,
     dependencies: Set<QueryCacheEntityId>,
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
     changedEntities: Set<QueryCacheEntityId>,
-    path: JsonPath
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>,
+    path: JsonPath | undefined
   ): QueryCacheInternalValue {
     if (value === null || typeof value !== 'object') return value;
     if (Array.isArray(value)) {
       const out = new Array(value.length) as QueryCacheInternalArray;
       for (let i = 0; i < value.length; i++) {
-        out[i] = normalizeValue(value[i], dependencies, changedEntities, path.concat(i));
+        out[i] = normalizeValue(
+          value[i],
+          dependencies,
+          dependencyFields,
+          changedEntities,
+          changedEntityFields,
+          path === undefined ? undefined : path.concat(i)
+        );
       }
       return out;
     }
-    const object = normalizeObject(value, dependencies, changedEntities, path);
+    const keys = Object.keys(value);
+    const object = normalizeObjectWithKeys(value, keys, dependencies, dependencyFields, changedEntities, changedEntityFields, path);
     const id = identify(value, path);
     if (id !== null) {
       dependencies.add(id);
+      recordDependencyFields(dependencyFields, id, keys);
       const previous = entities.get(id);
+      const merged = mergeEntityRecord(previous, object);
       const changed = previous === undefined || !equalsJsonFast(
         previous as unknown as JsonValue,
-        object as unknown as JsonValue
+        merged as unknown as JsonValue
       );
-      entities.set(id, object);
-      if (changed) changedEntities.add(id);
+      entities.set(id, merged);
+      if (changed) {
+        changedEntities.add(id);
+        recordChangedEntityFields(changedEntityFields, id, collectChangedObjectFields(previous, merged));
+      }
       if (hasEntityObservers(id)) {
         if (changed && previous !== undefined) {
           const previousValue = denormalizeValue(previous, new Set()) as JsonValue;
-          const nextValue = denormalizeValue(object, new Set()) as JsonValue;
+          const nextValue = denormalizeValue(merged, new Set()) as JsonValue;
           queueEntityPatch(id, diff(previousValue, nextValue));
         } else if (changed) {
-          queueEntityPatch(id, rootSetPatch(denormalizeValue(object, new Set()) as JsonValue));
+          queueEntityPatch(id, rootSetPatch(denormalizeValue(merged, new Set()) as JsonValue));
         }
       }
-      return createReference(id);
+      return createReference(id, keys);
     }
     return object;
   }
@@ -552,15 +717,43 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   function normalizeObject(
     value: JsonObject,
     dependencies: Set<QueryCacheEntityId>,
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
     changedEntities: Set<QueryCacheEntityId>,
-    path: JsonPath
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>,
+    path: JsonPath | undefined
+  ): QueryCacheInternalObject {
+    return normalizeObjectWithKeys(
+      value,
+      Object.keys(value),
+      dependencies,
+      dependencyFields,
+      changedEntities,
+      changedEntityFields,
+      path
+    );
+  }
+
+  function normalizeObjectWithKeys(
+    value: JsonObject,
+    keys: readonly string[],
+    dependencies: Set<QueryCacheEntityId>,
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
+    changedEntities: Set<QueryCacheEntityId>,
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>,
+    path: JsonPath | undefined
   ): QueryCacheInternalObject {
     const out: QueryCacheInternalObject = {};
-    const keys = Object.keys(value);
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i];
       const item = value[key];
-      out[key] = normalizeValue(item, dependencies, changedEntities, path.concat(key));
+      out[key] = normalizeValue(
+        item,
+        dependencies,
+        dependencyFields,
+        changedEntities,
+        changedEntityFields,
+        path === undefined ? undefined : path.concat(key)
+      );
     }
     return out;
   }
@@ -578,7 +771,10 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       const record = entities.get(id);
       if (record === undefined) return null;
       seen.add(id);
-      const denormalized = denormalizeValue(record, seen);
+      const fields = readReferenceFields(value);
+      const denormalized = fields === null
+        ? denormalizeValue(record, seen)
+        : denormalizeProjectedRecord(record, fields, seen);
       seen.delete(id);
       return denormalized;
     }
@@ -587,6 +783,20 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i];
       out[key] = denormalizeValue(value[key], seen);
+    }
+    return out;
+  }
+
+  function denormalizeProjectedRecord(
+    record: QueryCacheInternalObject,
+    fields: readonly string[],
+    seen: Set<QueryCacheEntityId>
+  ): JsonValue {
+    const out: JsonObject = {};
+    for (let i = 0; i < fields.length; i++) {
+      const key = fields[i];
+      if (!Object.hasOwn(record, key)) continue;
+      out[key] = denormalizeValue(record[key], seen);
     }
     return out;
   }
@@ -603,7 +813,17 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       out.add(id);
       seen.add(id);
       const record = entities.get(id);
-      if (record !== undefined) collectReachableDependencies(record, out, seen);
+      if (record !== undefined) {
+        const fields = readReferenceFields(value);
+        if (fields === null) {
+          collectReachableDependencies(record, out, seen);
+        } else {
+          for (let i = 0; i < fields.length; i++) {
+            const key = fields[i];
+            if (Object.hasOwn(record, key)) collectReachableDependencies(record[key], out, seen);
+          }
+        }
+      }
       seen.delete(id);
       return;
     }
@@ -611,7 +831,208 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     for (let i = 0; i < keys.length; i++) collectReachableDependencies(value[keys[i]], out, seen);
   }
 
-  function refreshDependentQueries(ids: Set<QueryCacheEntityId>, skipHash?: string): void {
+  function collectDependencyFields(
+    value: QueryCacheInternalValue,
+    out: Map<QueryCacheEntityId, QueryCacheDependencyFields> = new Map(),
+    seen: Set<QueryCacheEntityId> = new Set()
+  ): Map<QueryCacheEntityId, QueryCacheDependencyFields> {
+    if (value === null || typeof value !== 'object') return out;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) collectDependencyFields(value[i], out, seen);
+      return out;
+    }
+    if (isReference(value)) {
+      const id = value[REF_KEY];
+      const fields = readReferenceFields(value);
+      recordDependencyFields(out, id, fields);
+      if (seen.has(id)) return out;
+      const record = entities.get(id);
+      if (record === undefined) return out;
+      seen.add(id);
+      if (fields === null) {
+        collectDependencyFields(record, out, seen);
+      } else {
+        for (let i = 0; i < fields.length; i++) {
+          const key = fields[i];
+          if (Object.hasOwn(record, key)) collectDependencyFields(record[key], out, seen);
+        }
+      }
+      seen.delete(id);
+      return out;
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) collectDependencyFields(value[keys[i]], out, seen);
+    return out;
+  }
+
+  function cloneDependencyFields(
+    fields: Map<QueryCacheEntityId, QueryCacheDependencyFields>
+  ): Map<QueryCacheEntityId, QueryCacheDependencyFields> {
+    const out = new Map<QueryCacheEntityId, QueryCacheDependencyFields>();
+    for (const [id, value] of fields) {
+      out.set(id, value === null ? null : Array.isArray(value) ? value : new Set(value));
+    }
+    return out;
+  }
+
+  function mergeDependencyFields(
+    target: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
+    source: Map<QueryCacheEntityId, QueryCacheDependencyFields>
+  ): void {
+    for (const [id, fields] of source) {
+      const previous = target.get(id);
+      if (previous === null) continue;
+      if (fields === null) {
+        target.set(id, null);
+        continue;
+      }
+      if (previous === undefined) {
+        target.set(id, Array.isArray(fields) ? fields : new Set(fields));
+        continue;
+      }
+      target.set(id, addDependencyFields(previous, fields));
+    }
+  }
+
+  function recordDependencyFields(
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
+    id: QueryCacheEntityId,
+    fields: readonly string[] | null
+  ): void {
+    const previous = dependencyFields.get(id);
+    if (previous === null) return;
+    if (fields === null) {
+      dependencyFields.set(id, null);
+      return;
+    }
+    if (previous === undefined) {
+      dependencyFields.set(id, fields);
+      return;
+    }
+    dependencyFields.set(id, addDependencyFields(previous, fields));
+  }
+
+  function ensureDependencyFields(
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
+    dependencies: Set<QueryCacheEntityId>
+  ): void {
+    for (const id of dependencies) {
+      if (!dependencyFields.has(id)) dependencyFields.set(id, null);
+    }
+    for (const id of dependencyFields.keys()) {
+      if (!dependencies.has(id)) dependencyFields.delete(id);
+    }
+  }
+
+  function dependencyFieldsIntersect(
+    dependencyFields: Map<QueryCacheEntityId, QueryCacheDependencyFields>,
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>
+  ): boolean {
+    if (changedEntityFields.size === 0) return true;
+    for (const [id, changedFields] of changedEntityFields) {
+      const fields = dependencyFields.get(id);
+      if (fields === undefined) continue;
+      if (fields === null || changedFields === null) return true;
+      if (fields instanceof Set) {
+        if (setsIntersect(fields, changedFields)) return true;
+      } else {
+        let intersects = false;
+        for (let i = 0; i < fields.length; i++) {
+          if (changedFields.has(fields[i])) {
+            intersects = true;
+            break;
+          }
+        }
+        dependencyFields.set(id, new Set(fields));
+        if (intersects) return true;
+      }
+    }
+    return false;
+  }
+
+  function addDependencyFields(
+    previous: Exclude<QueryCacheDependencyFields, null>,
+    fields: Exclude<QueryCacheDependencyFields, null>
+  ): Exclude<QueryCacheDependencyFields, null> {
+    if (previous instanceof Set) {
+      if (fields instanceof Set) {
+        for (const field of fields) previous.add(field);
+      } else {
+        for (let i = 0; i < fields.length; i++) previous.add(fields[i]);
+      }
+      return previous;
+    }
+    if (Array.isArray(fields) && sameFieldArray(previous, fields)) return previous;
+    const merged = new Set(previous);
+    if (fields instanceof Set) {
+      for (const field of fields) merged.add(field);
+    } else {
+      for (let i = 0; i < fields.length; i++) merged.add(fields[i]);
+    }
+    return merged;
+  }
+
+  function sameFieldArray(left: readonly string[], right: readonly string[]): boolean {
+    if (left.length !== right.length) return false;
+    for (let i = 0; i < left.length; i++) {
+      if (left[i] !== right[i]) return false;
+    }
+    return true;
+  }
+
+  function mergeEntityRecord(
+    previous: QueryCacheInternalObject | undefined,
+    incoming: QueryCacheInternalObject
+  ): QueryCacheInternalObject {
+    if (previous === undefined) return incoming;
+    const merged: QueryCacheInternalObject = { ...previous };
+    const keys = Object.keys(incoming);
+    for (let i = 0; i < keys.length; i++) merged[keys[i]] = incoming[keys[i]];
+    return merged;
+  }
+
+  function collectChangedObjectFields(
+    previous: QueryCacheInternalObject | undefined,
+    next: QueryCacheInternalObject
+  ): Set<string> | null {
+    if (previous === undefined) return null;
+    const fields = new Set<string>();
+    const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+    for (const key of keys) {
+      if (!equalsJsonFast(
+        previous[key] as unknown as JsonValue,
+        next[key] as unknown as JsonValue
+      )) {
+        fields.add(key);
+      }
+    }
+    return fields;
+  }
+
+  function recordChangedEntityFields(
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>,
+    id: QueryCacheEntityId,
+    fields: Set<string> | null
+  ): void {
+    if (fields !== null && fields.size === 0) return;
+    const previous = changedEntityFields.get(id);
+    if (previous === null) return;
+    if (fields === null) {
+      changedEntityFields.set(id, null);
+      return;
+    }
+    if (previous === undefined) {
+      changedEntityFields.set(id, new Set(fields));
+      return;
+    }
+    for (const field of fields) previous.add(field);
+  }
+
+  function refreshDependentQueries(
+    ids: Set<QueryCacheEntityId>,
+    skipHash?: string,
+    changedEntityFields?: Map<QueryCacheEntityId, Set<string> | null>
+  ): void {
     const hashes = new Set<string>();
     for (const id of ids) {
       const bucket = entityQueries.get(id);
@@ -623,10 +1044,17 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       if (hash === skipHash) continue;
       const entry = queries.get(hash);
       if (entry === undefined) continue;
+      if (changedEntityFields !== undefined && !dependencyFieldsIntersect(entry.dependencyFields, changedEntityFields)) {
+        continue;
+      }
+      if (changedEntityFields !== undefined && refreshRootArrayEntityFields(entry, ids, changedEntityFields)) {
+        continue;
+      }
       const previous = entry.value;
       const previousDependencies = entry.dependencies;
       const dependencies = new Set<QueryCacheEntityId>();
       collectReachableDependencies(entry.root, dependencies, new Set());
+      ensureDependencyFields(entry.dependencyFields, dependencies);
       const next = denormalizeValue(entry.root, new Set()) as JsonValue;
       entry.dependencies = dependencies;
       updateQueryDependencyIndex(entry.hash, previousDependencies, dependencies);
@@ -639,8 +1067,69 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     }
   }
 
+  function refreshRootArrayEntityFields(
+    entry: QueryCacheEntry,
+    changedIds: Set<QueryCacheEntityId>,
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>
+  ): boolean {
+    if (!Array.isArray(entry.root) || !Array.isArray(entry.value) || changedEntityFields.size !== 1) return false;
+    const iterator = changedEntityFields.entries().next();
+    if (iterator.done) return false;
+    const id = iterator.value[0];
+    const fields = iterator.value[1];
+    if (!changedIds.has(id) || fields === null || fields.size === 0) return false;
+    const record = entities.get(id);
+    if (record === undefined) return false;
+    const rowIndexes: number[] = [];
+    const fieldPaths: JsonPath[] = [];
+    const baseValues: JsonValue[] = [];
+
+    for (const field of fields) {
+      if (!Object.hasOwn(record, field)) return false;
+      const normalized = record[field];
+      if (normalized !== null && typeof normalized === 'object') return false;
+      fieldPaths[fieldPaths.length] = [field];
+      baseValues[baseValues.length] = normalized as JsonValue;
+    }
+    if (fieldPaths.length === 0) return false;
+
+    for (let i = 0; i < entry.root.length; i++) {
+      const item = entry.root[i];
+      if (item === null || typeof item !== 'object' || Array.isArray(item) || !isReference(item) || item[REF_KEY] !== id) continue;
+      const projectedFields = readReferenceFields(item);
+      if (projectedFields === null) return false;
+      for (let fieldIndex = 0; fieldIndex < fieldPaths.length; fieldIndex++) {
+        if (!projectedFields.includes(fieldPaths[fieldIndex][0] as string)) return false;
+      }
+      rowIndexes[rowIndexes.length] = i;
+    }
+    if (rowIndexes.length === 0) return false;
+
+    const nextValue = entry.value.slice() as JsonValue[];
+    const values: JsonValue[] = [];
+    for (let rowOffset = 0; rowOffset < rowIndexes.length; rowOffset++) {
+      const index = rowIndexes[rowOffset];
+      const row = nextValue[index];
+      if (!isJsonObject(row)) return false;
+      const nextRow: JsonObject = { ...row };
+      for (let fieldIndex = 0; fieldIndex < fieldPaths.length; fieldIndex++) {
+        const value = baseValues[fieldIndex];
+        nextRow[fieldPaths[fieldIndex][0]] = value;
+        values[values.length] = value;
+      }
+      nextValue[index] = nextRow;
+    }
+
+    entry.value = nextValue as JsonValue;
+    entry.updatedAt = now();
+    entry.stale = false;
+    queueQueryPatch(entry.hash, [[OP_ARRAY_OBJECT_FIELD_ASSIGN, [], rowIndexes, fieldPaths, values] as PatchOperation]);
+    return true;
+  }
+
   function queueQueryPatch(hash: string, patch: Patch): void {
     if (patch.length === 0) return;
+    if (batchDepth === 0 && !hasQueryObservers(hash)) return;
     const entry = queries.get(hash);
     if (batchDepth > 0) {
       const pending = pendingQueries.get(hash);
@@ -699,7 +1188,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       const callbacks = Array.from(bucket);
       for (let i = 0; i < callbacks.length; i++) callbacks[i](clonePatch(patch));
     }
-    if (!emitQueryEvent) return;
+    if (!emitQueryEvent || listeners.size === 0) return;
     const entry = queries.get(hash);
     if (entry !== undefined) {
       emitEvent({
@@ -719,7 +1208,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       const callbacks = Array.from(bucket);
       for (let i = 0; i < callbacks.length; i++) callbacks[i](clonePatch(patch));
     }
-    if (emitEntityEvent) emitEvent({ type: 'entity', id, patch: clonePatch(patch) });
+    if (emitEntityEvent && listeners.size !== 0) emitEvent({ type: 'entity', id, patch: clonePatch(patch) });
   }
 
   function hasEntityObservers(id: QueryCacheEntityId): boolean {
@@ -737,17 +1226,28 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     previous: Set<QueryCacheEntityId> | undefined,
     next: Set<QueryCacheEntityId>
   ): void {
-    if (previous !== undefined) {
-      for (const id of previous) {
-        if (next.has(id)) continue;
-        const bucket = entityQueries.get(id);
-        if (bucket === undefined) continue;
-        bucket.delete(hash);
-        if (bucket.size === 0) entityQueries.delete(id);
-      }
+    if (previous === undefined) {
+      addQueryDependencies(hash, next);
+      return;
+    }
+    if (previous === next) return;
+    for (const id of previous) {
+      if (next.has(id)) continue;
+      const bucket = entityQueries.get(id);
+      if (bucket === undefined) continue;
+      bucket.delete(hash);
+      if (bucket.size === 0) entityQueries.delete(id);
     }
     for (const id of next) {
-      if (previous !== undefined && previous.has(id)) continue;
+      if (previous.has(id)) continue;
+      let bucket = entityQueries.get(id);
+      if (bucket === undefined) entityQueries.set(id, (bucket = new Set()));
+      bucket.add(hash);
+    }
+  }
+
+  function addQueryDependencies(hash: string, dependencies: Set<QueryCacheEntityId>): void {
+    for (const id of dependencies) {
       let bucket = entityQueries.get(id);
       if (bucket === undefined) entityQueries.set(id, (bucket = new Set()));
       bucket.add(hash);
@@ -760,7 +1260,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     for (let i = 0; i < callbacks.length; i++) callbacks[i](cloneEvent(event));
   }
 
-  return {
+  const api: QueryCache & QueryCacheOwnedSnapshotSource = {
     writeQuery,
     getQueryData,
     getQueryInfo,
@@ -779,8 +1279,10 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     rollbackOptimistic,
     extract,
     restore,
-    clear
+    clear,
+    [QUERY_CACHE_EXTRACT_OWNED]: extractOwnedSnapshot
   };
+  return api;
 }
 
 export { hashQueryKey, partialMatchQueryKey } from '@shapeshift-labs/frontier-query';
@@ -790,7 +1292,22 @@ export function mergeOffsetPage(existing: JsonValue | undefined, incoming: JsonV
   const offset = Math.max(0, Math.floor(options.offset || 0));
   const out = Array.isArray(existing) ? cloneJson(existing) : [];
   for (let i = 0; i < incoming.length; i++) out[offset + i] = cloneJson(incoming[i]);
+  markOffsetPageMerge(out, offset, incoming);
   return out as JsonValue;
+}
+
+function markOffsetPageMerge(out: unknown[], offset: number, incoming: readonly JsonValue[]): void {
+  Object.defineProperty(out, OFFSET_PAGE_MERGE, {
+    value: { offset, length: incoming.length },
+    enumerable: false,
+    configurable: false
+  });
+}
+
+function readOffsetPageMergeInfo(value: JsonValue): OffsetPageMergeInfo | undefined {
+  return Array.isArray(value)
+    ? (value as unknown as { [OFFSET_PAGE_MERGE]?: OffsetPageMergeInfo })[OFFSET_PAGE_MERGE]
+    : undefined;
 }
 
 export function mergeUniqueList(existing: JsonValue | undefined, incoming: JsonValue, options: UniqueListMergeOptions = {}): JsonValue {
@@ -815,12 +1332,15 @@ export function mergeUniqueList(existing: JsonValue | undefined, incoming: JsonV
 
 export function createQueryCacheMemoryStorageAdapter(initial: QueryCacheSnapshot | null = null): QueryCacheMemoryStorageAdapter {
   let snapshot = initial === null ? null : cloneSnapshot(initial);
-  return {
+  const adapter: QueryCacheMemoryStorageAdapter & QueryCacheOwnedSnapshotStorage = {
     load() {
       return snapshot === null ? null : cloneSnapshot(snapshot);
     },
     save(next: QueryCacheSnapshot) {
       snapshot = cloneSnapshot(next);
+    },
+    [MEMORY_STORAGE_SAVE_OWNED](next: QueryCacheSnapshot) {
+      snapshot = next;
     },
     clear() {
       snapshot = null;
@@ -829,6 +1349,7 @@ export function createQueryCacheMemoryStorageAdapter(initial: QueryCacheSnapshot
       return snapshot === null ? null : cloneSnapshot(snapshot);
     }
   };
+  return adapter;
 }
 
 export function persistQueryCache(
@@ -935,7 +1456,13 @@ export function persistQueryCache(
     try {
       while (saveRequested && !disposed) {
         saveRequested = false;
-        await storage.save(cache.extract());
+        const saveOwned = (storage as QueryCacheOwnedSnapshotStorage)[MEMORY_STORAGE_SAVE_OWNED];
+        if (saveOwned === undefined) {
+          await storage.save(cache.extract());
+        } else {
+          const extractOwned = (cache as QueryCacheOwnedSnapshotSource)[QUERY_CACHE_EXTRACT_OWNED];
+          await saveOwned.call(storage, extractOwned === undefined ? cache.extract() : extractOwned.call(cache));
+        }
         saves++;
       }
     } catch (error) {
@@ -1105,7 +1632,7 @@ function readUniqueListKey(value: JsonValue, index: number, options: UniqueListM
 }
 
 function rootSetPatch(value: JsonValue): Patch {
-  return [[OP_SET, [], cloneJson(value)] as PatchOperation];
+  return [[OP_SET, [], value] as PatchOperation];
 }
 
 function clonePatch(patch: Patch): Patch {
@@ -1199,12 +1726,24 @@ function cloneSnapshot(snapshot: QueryCacheSnapshot): QueryCacheSnapshot {
   return cloneJson(snapshot as unknown as JsonValue) as unknown as QueryCacheSnapshot;
 }
 
-function createReference(id: string): QueryCacheInternalRef {
-  return { [REF_KEY]: id };
+function createReference(id: string, fields: readonly string[]): QueryCacheInternalRef {
+  return { [REF_KEY]: id, [REF_FIELDS_KEY]: fields as string[] };
 }
 
 function isReference(value: QueryCacheInternalObject | QueryCacheInternalRef): value is QueryCacheInternalRef {
-  return Object.keys(value).length === 1 && typeof value[REF_KEY] === 'string';
+  return typeof value[REF_KEY] === 'string';
+}
+
+function readReferenceFields(value: QueryCacheInternalRef): readonly string[] | null {
+  const fields = value[REF_FIELDS_KEY];
+  return Array.isArray(fields) ? fields : null;
+}
+
+function setsIntersect(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+  return false;
 }
 
 function isEntityIdValue(value: unknown): value is string | number | boolean {

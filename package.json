@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-state-cache",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Normalized query-result cache for Frontier packages and application state.",
   "type": "module",
   "license": "MIT",
@@ -55,11 +55,11 @@
     "mutation"
   ],
   "dependencies": {
-    "@shapeshift-labs/frontier": "^0.1.5",
-    "@shapeshift-labs/frontier-query": "^0.1.0"
+    "@shapeshift-labs/frontier": "^0.1.7",
+    "@shapeshift-labs/frontier-query": "^0.1.2"
   },
   "peerDependencies": {
-    "@shapeshift-labs/frontier-mutation": "^0.1.3"
+    "@shapeshift-labs/frontier-mutation": "^0.1.4"
   },
   "peerDependenciesMeta": {
     "@shapeshift-labs/frontier-mutation": {
@@ -67,7 +67,7 @@
     }
   },
   "devDependencies": {
-    "@shapeshift-labs/frontier-mutation": "^0.1.3",
+    "@shapeshift-labs/frontier-mutation": "^0.1.4",
     "typescript": "^6.0.3"
   },
   "author": "james addison"

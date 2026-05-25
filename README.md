@@ -12,17 +12,25 @@ This package stores query results with normalized entities, query/entity watcher
 
 - [`@shapeshift-labs/frontier`](https://www.npmjs.com/package/@shapeshift-labs/frontier): core JSON diff/apply primitives used for watcher patches.
 - [`@shapeshift-labs/frontier-query`](https://www.npmjs.com/package/@shapeshift-labs/frontier-query): shared query-key, selector path, condition, identity, and table-schema primitives.
+- [`@shapeshift-labs/frontier-state`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state): app-state subscriptions and maintained views; related to cache but intentionally not a dependency.
+- [`@shapeshift-labs/frontier-schema`](https://www.npmjs.com/package/@shapeshift-labs/frontier-schema): schema/profile helpers and table-schema normalization for cache-adjacent data contracts.
 - [`@shapeshift-labs/frontier-mutation`](https://www.npmjs.com/package/@shapeshift-labs/frontier-mutation): optional mutation-plan bridge available from `@shapeshift-labs/frontier-state-cache/mutation`.
 - [`@shapeshift-labs/frontier-engine`](https://www.npmjs.com/package/@shapeshift-labs/frontier-engine): planned diff engine for higher-level state and mutation layers.
 - [`@shapeshift-labs/frontier-codec`](https://www.npmjs.com/package/@shapeshift-labs/frontier-codec): patch serialization, binary frames, canonical JSON, and patch-history codecs.
+- [`@shapeshift-labs/frontier-event-log`](https://www.npmjs.com/package/@shapeshift-labs/frontier-event-log): bounded event logs and replay cursors; related to cache change logs but intentionally separate.
+- [`@shapeshift-labs/frontier-logging`](https://www.npmjs.com/package/@shapeshift-labs/frontier-logging): opt-in structured logging, telemetry buffers, exporters, and Frontier patch summaries.
 
 Package source repositories:
 
 - [`siliconjungle/-shapeshift-labs-frontier`](https://github.com/siliconjungle/-shapeshift-labs-frontier)
 - [`siliconjungle/-shapeshift-labs-frontier-query`](https://github.com/siliconjungle/-shapeshift-labs-frontier-query)
+- [`siliconjungle/-shapeshift-labs-frontier-state`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state)
+- [`siliconjungle/-shapeshift-labs-frontier-schema`](https://github.com/siliconjungle/-shapeshift-labs-frontier-schema)
 - [`siliconjungle/-shapeshift-labs-frontier-mutation`](https://github.com/siliconjungle/-shapeshift-labs-frontier-mutation)
 - [`siliconjungle/-shapeshift-labs-frontier-engine`](https://github.com/siliconjungle/-shapeshift-labs-frontier-engine)
 - [`siliconjungle/-shapeshift-labs-frontier-codec`](https://github.com/siliconjungle/-shapeshift-labs-frontier-codec)
+- [`siliconjungle/-shapeshift-labs-frontier-event-log`](https://github.com/siliconjungle/-shapeshift-labs-frontier-event-log)
+- [`siliconjungle/-shapeshift-labs-frontier-logging`](https://github.com/siliconjungle/-shapeshift-labs-frontier-logging)
 
 ## Install
 
@@ -201,18 +209,18 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 3 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, default rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Write normalized query result | 171.06 us | 187.54 us |
-| Modify normalized entity | 30.33 us | 52.33 us |
-| Modify entity with query watchers | 63.04 us | 115.54 us |
-| Offset page merge write | 15.97 ms | 23.28 ms |
-| Memory persistence flush | 7.30 ms | 10.06 ms |
-| Bounded change-log read | 0.37 us | 1.25 us |
-| Mutation bridge query commit | 3.88 ms | 6.41 ms |
-| Mutation bridge entity commit | 34.37 us | 61.21 us |
+| Write normalized query result | 129.02 us | 191.15 us |
+| Modify normalized entity | 8.25 us | 32.13 us |
+| Modify entity with query watchers | 8.54 us | 32.83 us |
+| Offset page merge write | 1.20 ms | 2.29 ms |
+| Memory persistence flush | 537.38 us | 2.21 ms |
+| Bounded change-log read | 0.29 us | 0.83 us |
+| Mutation bridge query commit | 3.11 ms | 10.69 ms |
+| Mutation bridge entity commit | 9.33 us | 15.08 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 

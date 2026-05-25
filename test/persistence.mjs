@@ -8,6 +8,22 @@ import {
 } from '../dist/index.js';
 
 {
+  const storage = createQueryCacheMemoryStorageAdapter();
+  const snapshot = {
+    entities: {
+      'Todo:1': { __typename: 'Todo', id: '1', text: 'saved' }
+    },
+    queries: []
+  };
+  storage.save(snapshot);
+  snapshot.entities['Todo:1'].text = 'mutated';
+  const stored = storage.getSnapshot();
+  assert.strictEqual(stored.entities['Todo:1'].text, 'saved');
+  stored.entities['Todo:1'].text = 'mutated-again';
+  assert.strictEqual(storage.getSnapshot().entities['Todo:1'].text, 'saved');
+}
+
+{
   const source = createQueryCache({ now: () => 10 });
   const storage = createQueryCacheMemoryStorageAdapter();
   const persistence = persistQueryCache(source, storage, { debounceMs: 1000 });
@@ -17,11 +33,16 @@ import {
   ]);
   await persistence.flush();
 
+  source.modifyEntity('Todo:1', (todo) => ({ ...todo, text: 'draft' }));
+  assert.strictEqual(storage.getSnapshot().queries[0].value[0].text, 'ship');
+  await persistence.flush();
+  assert.strictEqual(storage.getSnapshot().queries[0].value[0].text, 'draft');
+
   const restored = createQueryCache();
   const restoredPersistence = persistQueryCache(restored, storage);
   assert.strictEqual(await restoredPersistence.hydrate(), true);
   assert.deepStrictEqual(restored.getQueryData(['todos']), [
-    { __typename: 'Todo', id: '1', text: 'ship', done: false }
+    { __typename: 'Todo', id: '1', text: 'draft', done: false }
   ]);
   assert.strictEqual(restoredPersistence.getStats().loads, 1);
 
