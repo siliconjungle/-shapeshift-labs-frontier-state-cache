@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-state-cache",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Normalized query-result cache for Frontier packages and application state.",
   "type": "module",
   "license": "MIT",
