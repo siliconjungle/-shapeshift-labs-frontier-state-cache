@@ -18,6 +18,11 @@ const EMPTY_PATH: JsonPath = [];
 const OFFSET_PAGE_MERGE = Symbol('frontier.offsetPageMerge');
 const MEMORY_STORAGE_SAVE_OWNED = Symbol('frontier.memoryStorageSaveOwned');
 const QUERY_CACHE_EXTRACT_OWNED = Symbol('frontier.queryCacheExtractOwned');
+const QUERY_CATCH_UP_VALUE_KEY = '\u0000frontierQueryValue';
+
+type ReplayApplyPatchImmutable = (value: JsonValue, patch: Patch) => JsonValue;
+
+let replayApplyPatchImmutable: Promise<ReplayApplyPatchImmutable> | undefined;
 
 type QueryCacheScalarKey = string | number | boolean | null;
 type QueryCacheInternalRef = { [REF_KEY]: string; [REF_FIELDS_KEY]?: string[] };
@@ -45,6 +50,41 @@ type QueryCachePendingPatch = {
   patch: Patch;
 };
 
+type QueryCacheMaintainedQueryEntry = {
+  key: QueryCacheKey;
+  hash: string;
+  filter?: QueryCacheMaintainedQueryFilter;
+  sort?: QueryCacheMaintainedQuerySort;
+  select?: QueryCacheMaintainedQuerySelect;
+  limit: number;
+  ids: QueryCacheEntityId[];
+  values: Map<QueryCacheEntityId, JsonObject>;
+  visible: JsonValue;
+  active: boolean;
+};
+
+type QueryCacheDependencyNodeEntry = {
+  id: QueryCacheDependencyKey;
+  dependencies: Set<QueryCacheDependencyKey>;
+  dependents: Set<QueryCacheDependencyKey>;
+  queryHash?: string;
+};
+
+type QueryCacheCatchUpEntry = {
+  key: QueryCacheKey;
+  hash: string;
+  clock: number;
+  records: Map<string, QueryCacheCatchUpRecord>;
+};
+
+type QueryCacheCatchUpRecord = {
+  clock: number;
+  updatedAt: number;
+  entityId?: QueryCacheEntityId;
+  value?: JsonValue;
+  removed?: boolean;
+};
+
 type OffsetPageMergeInfo = {
   offset: number;
   length: number;
@@ -64,6 +104,15 @@ export type QueryCacheWatchCallback = (patch: Patch) => void;
 export type QueryCacheEventListener = (event: QueryCacheEvent) => void;
 export type QueryCacheEntityInput = QueryEntityInput;
 export type QueryCacheIdentifyContext = QueryEntityIdentifyContext;
+export type QueryCacheDependencyKey = string;
+export type QueryCacheMaintainedQueryFilter = (entity: JsonObject, id: QueryCacheEntityId) => boolean;
+export type QueryCacheMaintainedQuerySort = (
+  left: JsonObject,
+  right: JsonObject,
+  leftId: QueryCacheEntityId,
+  rightId: QueryCacheEntityId
+) => number;
+export type QueryCacheMaintainedQuerySelect = (entity: JsonObject, id: QueryCacheEntityId) => JsonValue;
 
 export interface QueryCacheSubscription {
   readonly active: boolean;
@@ -94,6 +143,29 @@ export interface QueryCacheWriteOptions {
   stale?: boolean;
 }
 
+export interface QueryCacheMaintainedQueryOptions {
+  filter?: QueryCacheMaintainedQueryFilter;
+  sort?: QueryCacheMaintainedQuerySort;
+  limit?: number;
+  select?: QueryCacheMaintainedQuerySelect;
+}
+
+export interface QueryCacheMaintainedQuery extends QueryCacheSubscription {
+  refresh(): Patch;
+}
+
+export interface QueryCacheDependencyNode {
+  id: QueryCacheDependencyKey;
+  dependencies?: readonly QueryCacheDependencyKey[];
+  queryKey?: QueryCacheKey;
+}
+
+export interface QueryCacheDependencyInvalidation {
+  dependencyKey: QueryCacheDependencyKey;
+  visited: number;
+  invalidated: number;
+}
+
 export interface QueryCacheFilter {
   queryKey?: QueryCacheKey;
   exact?: boolean;
@@ -108,9 +180,34 @@ export interface QueryCacheEntryInfo {
   updatedAt: number;
 }
 
+export interface QueryCacheCatchUpOptions {
+  lastSeenClock?: number;
+  limit?: number;
+}
+
+export interface QueryCacheCatchUpChange {
+  clock: number;
+  updatedAt: number;
+  entityId?: QueryCacheEntityId;
+  value?: JsonValue;
+  removed?: boolean;
+}
+
+export interface QueryCacheCatchUpResult {
+  key: QueryCacheKey;
+  hash: string;
+  lastSeenClock: number;
+  nextLastSeenClock: number;
+  highWaterClock: number;
+  complete: boolean;
+  changes: QueryCacheCatchUpChange[];
+}
+
 export interface QueryCacheSnapshot {
   entities: Record<string, JsonObject>;
   queries: QueryCacheSnapshotQuery[];
+  catchUpClock?: number;
+  catchUp?: QueryCacheSnapshotCatchUpQuery[];
 }
 
 export interface QueryCacheSnapshotQuery {
@@ -123,26 +220,57 @@ export interface QueryCacheSnapshotQuery {
   updatedAt: number;
 }
 
-export interface QueryCacheStorageAdapter {
+export interface QueryCacheSnapshotCatchUpQuery {
+  key: QueryCacheKey;
+  hash: string;
+  clock: number;
+  changes: QueryCacheCatchUpChange[];
+}
+
+export interface QueryCacheChangeLogStorageReadOptions {
+  sinceSeq?: number;
+  limit?: number;
+}
+
+export interface QueryCacheDurableChangeLogStorageAdapter {
+  appendChange(entry: QueryCacheChangeLogEntry): void | Promise<void>;
+  readChangeLog?(options?: QueryCacheChangeLogStorageReadOptions): QueryCacheChangeLogEntry[] | Promise<QueryCacheChangeLogEntry[]>;
+  compact?(snapshot?: QueryCacheSnapshot): void | Promise<void>;
+}
+
+export interface QueryCacheStorageAdapter extends Partial<QueryCacheDurableChangeLogStorageAdapter> {
   load(): QueryCacheSnapshot | null | undefined | Promise<QueryCacheSnapshot | null | undefined>;
   save(snapshot: QueryCacheSnapshot): void | Promise<void>;
   clear?(): void | Promise<void>;
 }
 
+export interface QueryCachePersistenceChangeLogOptions {
+  includePatches?: boolean;
+}
+
 export interface QueryCachePersistenceOptions {
   autoHydrate?: boolean;
   debounceMs?: number;
+  changeLog?: boolean | QueryCachePersistenceChangeLogOptions;
+  replayChangeLog?: boolean;
+  compactOnFlush?: boolean;
   onError?: (error: unknown) => void;
 }
 
 export interface QueryCachePersistenceStats {
   loads: number;
   saves: number;
+  changes: number;
+  changeLogWrites: number;
+  replayedChanges: number;
   pending: boolean;
+  hydrating: boolean;
+  hydrated: boolean;
   disposed: boolean;
 }
 
 export interface QueryCachePersistence {
+  readonly ready: Promise<boolean>;
   hydrate(): Promise<boolean>;
   flush(): Promise<void>;
   clear(): Promise<void>;
@@ -221,6 +349,9 @@ export interface QueryCache {
   getQueryData(key: QueryCacheKey): JsonValue | undefined;
   getQueryInfo(key: QueryCacheKey): QueryCacheEntryInfo | undefined;
   getQueryHash(key: QueryCacheKey): string;
+  getQueryCatchUpClock(key: QueryCacheKey): number;
+  readQueryCatchUp(key: QueryCacheKey, options?: QueryCacheCatchUpOptions): QueryCacheCatchUpResult;
+  maintainQuery(key: QueryCacheKey, options?: QueryCacheMaintainedQueryOptions): QueryCacheMaintainedQuery;
   watchQuery(key: QueryCacheKey, callback: QueryCacheWatchCallback): QueryCacheSubscription;
   watchEntity(entity: QueryCacheEntityInput, callback: QueryCacheWatchCallback): QueryCacheSubscription;
   subscribe(listener: QueryCacheEventListener): () => void;
@@ -231,6 +362,9 @@ export interface QueryCache {
     updater: (current: JsonObject | undefined) => JsonObject | null | undefined
   ): Patch;
   removeEntity(entity: QueryCacheEntityInput): Patch;
+  setDependencyNode(node: QueryCacheDependencyNode): void;
+  deleteDependencyNode(id: QueryCacheDependencyKey): boolean;
+  invalidateDependency(id: QueryCacheDependencyKey): QueryCacheDependencyInvalidation;
   invalidateQueries(filter?: QueryCacheFilter): number;
   invalidateEntity(entity: QueryCacheEntityInput): number;
   batch<T>(callback: () => T): T;
@@ -265,6 +399,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   const entities = new Map<QueryCacheEntityId, QueryCacheInternalObject>();
   const queries = new Map<string, QueryCacheEntry>();
   const entityQueries = new Map<QueryCacheEntityId, Set<string>>();
+  const queryCatchUps = new Map<string, QueryCacheCatchUpEntry>();
   const queryWatchers = new Map<string, Set<QueryCacheWatchCallback>>();
   const entityWatchers = new Map<string, Set<QueryCacheWatchCallback>>();
   const listeners = new Set<QueryCacheEventListener>();
@@ -272,9 +407,13 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   const pendingQueries = new Map<string, QueryCachePendingPatch>();
   const pendingEntities = new Map<string, QueryCachePendingPatch>();
   const pendingEvents: QueryCacheEvent[] = [];
+  const maintainedQueries = new Map<string, QueryCacheMaintainedQueryEntry>();
+  const dependencyNodes = new Map<QueryCacheDependencyKey, QueryCacheDependencyNodeEntry>();
   const trackIdentifyPath = typeof options.identify === 'function';
   let batchDepth = 0;
   let sideEffectDepth = 0;
+  let maintainedRefreshDepth = 0;
+  let catchUpClock = 0;
 
   function writeQuery(key: QueryCacheKey, data: JsonValue, writeOptions: QueryCacheWriteOptions = {}): Patch {
     if (listeners.size === 0) return writeQueryNow(key, data, writeOptions);
@@ -326,9 +465,11 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     };
     queries.set(hash, nextEntry);
     updateQueryDependencyIndex(hash, previous ? previous.dependencies : undefined, dependencies);
+    recordQueryCatchUp(nextEntry, previous ? previous.dependencies : undefined, changedEntities, patch);
     if (patch.length !== 0) {
       queueQueryPatch(hash, patch);
     }
+    if (maintainedQueries.size !== 0) refreshMaintainedQueries(changedEntities, hash);
     refreshDependentQueries(changedEntities, hash, changedEntityFields);
     return clonePatch(patch);
   }
@@ -406,7 +547,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     };
     queries.set(hash, nextEntry);
     updateQueryDependencyIndex(hash, previous.dependencies, dependencies);
+    recordQueryCatchUp(nextEntry, previous.dependencies, changedEntities, patch);
     if (patch.length !== 0) queueQueryPatch(hash, patch);
+    if (maintainedQueries.size !== 0) refreshMaintainedQueries(changedEntities, hash);
     refreshDependentQueries(changedEntities, hash, changedEntityFields);
     return clonePatch(patch);
   }
@@ -419,6 +562,94 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   function getQueryInfo(key: QueryCacheKey): QueryCacheEntryInfo | undefined {
     const entry = queries.get(hashQueryKey(key));
     return entry === undefined ? undefined : entryInfo(entry);
+  }
+
+  function getQueryCatchUpClock(key: QueryCacheKey): number {
+    const catchUp = queryCatchUps.get(hashQueryKey(key));
+    return catchUp === undefined ? 0 : catchUp.clock;
+  }
+
+  function readQueryCatchUp(
+    key: QueryCacheKey,
+    readOptions: QueryCacheCatchUpOptions = {}
+  ): QueryCacheCatchUpResult {
+    const hash = hashQueryKey(key);
+    const catchUp = queryCatchUps.get(hash);
+    const entry = queries.get(hash);
+    const lastSeenClock = normalizeCatchUpClock(readOptions.lastSeenClock, 'lastSeenClock');
+    const limit = normalizeCatchUpLimit(readOptions.limit);
+    const highWaterClock = catchUp === undefined ? 0 : catchUp.clock;
+    const allChanges: QueryCacheCatchUpChange[] = [];
+
+    if (catchUp !== undefined) {
+      for (const record of catchUp.records.values()) {
+        if (record.clock > lastSeenClock) allChanges[allChanges.length] = cloneCatchUpRecord(record);
+      }
+      allChanges.sort((left, right) => left.clock - right.clock);
+    }
+
+    const complete = limit === undefined || allChanges.length <= limit;
+    const changes = limit === undefined ? allChanges : allChanges.slice(0, limit);
+    const completedClock = highWaterClock > lastSeenClock ? highWaterClock : lastSeenClock;
+    const nextLastSeenClock = changes.length === 0
+      ? complete ? completedClock : lastSeenClock
+      : complete ? completedClock : changes[changes.length - 1].clock;
+
+    return {
+      key: cloneJson(catchUp === undefined ? entry === undefined ? key : entry.key : catchUp.key),
+      hash,
+      lastSeenClock,
+      nextLastSeenClock,
+      highWaterClock,
+      complete,
+      changes
+    };
+  }
+
+  function maintainQuery(
+    key: QueryCacheKey,
+    maintainOptions: QueryCacheMaintainedQueryOptions = {}
+  ): QueryCacheMaintainedQuery {
+    const filter = maintainOptions.filter;
+    const sort = maintainOptions.sort;
+    const select = maintainOptions.select;
+    if (filter !== undefined && typeof filter !== 'function') throw new TypeError('maintainQuery filter must be a function');
+    if (sort !== undefined && typeof sort !== 'function') throw new TypeError('maintainQuery sort must be a function');
+    if (select !== undefined && typeof select !== 'function') throw new TypeError('maintainQuery select must be a function');
+    const limit = maintainOptions.limit === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.floor(maintainOptions.limit);
+    if (limit < 0 || Number.isNaN(limit)) throw new RangeError('maintainQuery limit must be a non-negative number');
+    const hash = hashQueryKey(key);
+    const previous = maintainedQueries.get(hash);
+    if (previous !== undefined) previous.active = false;
+    const entry: QueryCacheMaintainedQueryEntry = {
+      key: cloneJson(key),
+      hash,
+      filter,
+      sort,
+      select,
+      limit,
+      ids: [],
+      values: new Map(),
+      visible: [],
+      active: true
+    };
+    maintainedQueries.set(hash, entry);
+    refreshMaintainedQuery(entry);
+    return {
+      get active() {
+        return entry.active && maintainedQueries.get(hash) === entry;
+      },
+      refresh() {
+        if (!entry.active || maintainedQueries.get(hash) !== entry) return [];
+        return refreshMaintainedQuery(entry);
+      },
+      unsubscribe() {
+        if (maintainedQueries.get(hash) === entry) maintainedQueries.delete(hash);
+        entry.active = false;
+      }
+    };
   }
 
   function watchQuery(key: QueryCacheKey, callback: QueryCacheWatchCallback): QueryCacheSubscription {
@@ -520,6 +751,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const nextValue = denormalizeValue(normalized, new Set()) as JsonValue;
     const entityPatch = previousValue === undefined ? rootSetPatch(nextValue) : diff(previousValue, nextValue);
     if (entityPatch.length !== 0) queueEntityPatch(id, entityPatch);
+    if (maintainedQueries.size !== 0) refreshMaintainedQueries(changedEntities);
     refreshDependentQueries(changedEntities, undefined, changedEntityFields);
     return clonePatch(entityPatch);
   }
@@ -545,8 +777,97 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>([[id, null]]);
     const entityPatch = diff(previousValue, null);
     if (entityPatch.length !== 0) queueEntityPatch(id, entityPatch);
+    if (maintainedQueries.size !== 0) refreshMaintainedQueries(changedEntities);
     refreshDependentQueries(changedEntities, undefined, changedEntityFields);
     return clonePatch(entityPatch);
+  }
+
+  function setDependencyNode(node: QueryCacheDependencyNode): void {
+    if (node === null || typeof node !== 'object') throw new TypeError('dependency node must be an object');
+    const id = validateDependencyKey(node.id, 'dependency node id');
+    const dependencies = normalizeDependencyKeys(node.dependencies, id);
+    if (wouldCreateDependencyCycle(id, dependencies)) {
+      throw new RangeError('dependency node would create a cycle');
+    }
+    const entry = ensureDependencyNode(id);
+    const previousDependencies = entry.dependencies;
+    for (const dependency of previousDependencies) {
+      if (dependencies.has(dependency)) continue;
+      const dependencyEntry = dependencyNodes.get(dependency);
+      if (dependencyEntry !== undefined) dependencyEntry.dependents.delete(id);
+    }
+    for (const dependency of dependencies) {
+      const dependencyEntry = ensureDependencyNode(dependency);
+      dependencyEntry.dependents.add(id);
+    }
+    entry.dependencies = dependencies;
+    if (Object.hasOwn(node, 'queryKey')) {
+      if (node.queryKey === undefined) throw new TypeError('dependency node queryKey must be a JSON query key');
+      entry.queryHash = hashQueryKey(node.queryKey);
+    } else {
+      delete entry.queryHash;
+    }
+  }
+
+  function deleteDependencyNode(id: QueryCacheDependencyKey): boolean {
+    const dependencyKey = validateDependencyKey(id, 'dependency node id');
+    const entry = dependencyNodes.get(dependencyKey);
+    if (entry === undefined) return false;
+    for (const dependency of entry.dependencies) {
+      const dependencyEntry = dependencyNodes.get(dependency);
+      if (dependencyEntry !== undefined) dependencyEntry.dependents.delete(dependencyKey);
+    }
+    for (const dependent of entry.dependents) {
+      const dependentEntry = dependencyNodes.get(dependent);
+      if (dependentEntry !== undefined) dependentEntry.dependencies.delete(dependencyKey);
+    }
+    dependencyNodes.delete(dependencyKey);
+    return true;
+  }
+
+  function invalidateDependency(id: QueryCacheDependencyKey): QueryCacheDependencyInvalidation {
+    if (listeners.size === 0) return invalidateDependencyNow(id);
+    enterDeferredSideEffects();
+    try {
+      return invalidateDependencyNow(id);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function invalidateDependencyNow(id: QueryCacheDependencyKey): QueryCacheDependencyInvalidation {
+    const dependencyKey = validateDependencyKey(id, 'dependency key');
+    const root = dependencyNodes.get(dependencyKey);
+    if (root === undefined) {
+      return { dependencyKey, visited: 0, invalidated: 0 };
+    }
+    const seen = new Set<QueryCacheDependencyKey>([dependencyKey]);
+    const queue: QueryCacheDependencyKey[] = [dependencyKey];
+    const affectedHashes = new Set<string>();
+    let offset = 0;
+    let invalidated = 0;
+    while (offset < queue.length) {
+      const current = queue[offset++];
+      const entry = dependencyNodes.get(current);
+      if (entry === undefined) continue;
+      if (entry.queryHash !== undefined && !affectedHashes.has(entry.queryHash)) {
+        affectedHashes.add(entry.queryHash);
+        const query = queries.get(entry.queryHash);
+        if (query !== undefined) {
+          if (!query.stale) {
+            query.stale = true;
+            invalidated++;
+          }
+          queueEvent({ type: 'invalidate', key: cloneJson(query.key), hash: query.hash });
+        }
+      }
+      for (const dependent of entry.dependents) {
+        if (seen.has(dependent)) continue;
+        seen.add(dependent);
+        queue[queue.length] = dependent;
+      }
+    }
+    return { dependencyKey, visited: seen.size, invalidated };
   }
 
   function invalidateQueries(filter: QueryCacheFilter = {}): number {
@@ -658,7 +979,12 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
         updatedAt: entry.updatedAt
       };
     }
-    return { entities: entityOut, queries: queryOut };
+    const snapshot: QueryCacheSnapshot = { entities: entityOut, queries: queryOut };
+    if (queryCatchUps.size !== 0) {
+      snapshot.catchUpClock = catchUpClock;
+      snapshot.catchUp = extractCatchUpSnapshot();
+    }
+    return snapshot;
   }
 
   function extractOwnedSnapshot(): QueryCacheSnapshot {
@@ -678,7 +1004,12 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
         updatedAt: entry.updatedAt
       };
     }
-    return { entities: entityOut, queries: queryOut };
+    const snapshot: QueryCacheSnapshot = { entities: entityOut, queries: queryOut };
+    if (queryCatchUps.size !== 0) {
+      snapshot.catchUpClock = catchUpClock;
+      snapshot.catchUp = extractCatchUpSnapshot();
+    }
+    return snapshot;
   }
 
   function restore(snapshot: QueryCacheSnapshot): void {
@@ -688,6 +1019,8 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       entities.clear();
       queries.clear();
       entityQueries.clear();
+      queryCatchUps.clear();
+      catchUpClock = 0;
       const snapshotEntities = snapshot && snapshot.entities && typeof snapshot.entities === 'object'
         ? snapshot.entities
         : {};
@@ -713,6 +1046,11 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
         });
         updateQueryDependencyIndex(item.hash, undefined, dependencies);
       }
+      if (Array.isArray(snapshot && snapshot.catchUp)) {
+        restoreCatchUpSnapshot(snapshot);
+      } else {
+        seedCatchUpFromQueries();
+      }
       for (const [hash, entry] of queries) {
         const previous = previousQueryValues.get(hash);
         const patch = previous === undefined ? rootSetPatch(entry.value) : diff(previous, entry.value);
@@ -721,6 +1059,11 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       }
       for (const [hash] of previousQueryValues) {
         queueQueryPatch(hash, rootSetPatch(null));
+      }
+      if (maintainedQueries.size !== 0) {
+        for (const entry of maintainedQueries.values()) {
+          if (entry.active) refreshMaintainedQuery(entry);
+        }
       }
       queueEvent({ type: 'restore' });
     });
@@ -732,8 +1075,15 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       entities.clear();
       queries.clear();
       entityQueries.clear();
+      queryCatchUps.clear();
+      catchUpClock = 0;
       for (let i = 0; i < previousQueries.length; i++) {
         queueQueryPatch(previousQueries[i].hash, rootSetPatch(null));
+      }
+      if (maintainedQueries.size !== 0) {
+        for (const entry of maintainedQueries.values()) {
+          if (entry.active) refreshMaintainedQuery(entry);
+        }
       }
       queueEvent({ type: 'clear' });
     });
@@ -1107,6 +1457,124 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     for (const field of fields) previous.add(field);
   }
 
+  function refreshMaintainedQueries(
+    ids: Set<QueryCacheEntityId>,
+    skipHash?: string
+  ): void {
+    if (maintainedQueries.size === 0 || maintainedRefreshDepth !== 0 || ids.size === 0) return;
+    maintainedRefreshDepth++;
+    try {
+      for (const entry of maintainedQueries.values()) {
+        if (!entry.active || entry.hash === skipHash) continue;
+        let changed = false;
+        for (const id of ids) {
+          if (refreshMaintainedQueryEntity(entry, id)) changed = true;
+        }
+        if (changed) writeMaintainedQuery(entry);
+      }
+    } finally {
+      maintainedRefreshDepth--;
+    }
+  }
+
+  function refreshMaintainedQuery(entry: QueryCacheMaintainedQueryEntry): Patch {
+    if (maintainedRefreshDepth !== 0) return [];
+    maintainedRefreshDepth++;
+    try {
+      entry.ids = [];
+      entry.values.clear();
+      for (const [id, record] of entities) {
+        const value = denormalizeValue(record, new Set()) as JsonObject;
+        if (!maintainedQueryMatches(entry, value, id)) continue;
+        entry.values.set(id, value);
+        insertMaintainedQueryId(entry, id);
+      }
+      return writeMaintainedQuery(entry);
+    } finally {
+      maintainedRefreshDepth--;
+    }
+  }
+
+  function refreshMaintainedQueryEntity(entry: QueryCacheMaintainedQueryEntry, id: QueryCacheEntityId): boolean {
+    const previous = entry.values.get(id);
+    const record = entities.get(id);
+    const next = record === undefined ? undefined : denormalizeValue(record, new Set()) as JsonObject;
+    if (next === undefined || !maintainedQueryMatches(entry, next, id)) {
+      if (previous === undefined) return false;
+      entry.values.delete(id);
+      removeMaintainedQueryId(entry, id);
+      return true;
+    }
+    if (previous !== undefined && equalsJsonFast(previous as JsonValue, next as JsonValue) && entry.sort === undefined) {
+      return false;
+    }
+    if (previous !== undefined) removeMaintainedQueryId(entry, id);
+    entry.values.set(id, next);
+    insertMaintainedQueryId(entry, id);
+    return true;
+  }
+
+  function maintainedQueryMatches(
+    entry: QueryCacheMaintainedQueryEntry,
+    value: JsonObject,
+    id: QueryCacheEntityId
+  ): boolean {
+    return entry.filter === undefined || entry.filter(value, id);
+  }
+
+  function writeMaintainedQuery(entry: QueryCacheMaintainedQueryEntry): Patch {
+    const value = buildMaintainedQueryValue(entry);
+    if (equalsJsonFast(entry.visible, value)) return [];
+    entry.visible = cloneJson(value);
+    return writeQuery(entry.key, value);
+  }
+
+  function buildMaintainedQueryValue(entry: QueryCacheMaintainedQueryEntry): JsonValue {
+    const length = Math.min(entry.ids.length, entry.limit);
+    const out = new Array(length);
+    for (let i = 0; i < length; i++) {
+      const id = entry.ids[i];
+      const value = entry.values.get(id) as JsonObject;
+      out[i] = cloneJson(entry.select === undefined ? value : entry.select(value, id));
+    }
+    return out as JsonValue;
+  }
+
+  function insertMaintainedQueryId(entry: QueryCacheMaintainedQueryEntry, id: QueryCacheEntityId): void {
+    if (entry.sort === undefined) {
+      entry.ids[entry.ids.length] = id;
+      return;
+    }
+    const value = entry.values.get(id) as JsonObject;
+    let low = 0;
+    let high = entry.ids.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      const midId = entry.ids[mid];
+      const midValue = entry.values.get(midId) as JsonObject;
+      if (compareMaintainedQueryValues(entry, value, midValue, id, midId) < 0) high = mid;
+      else low = mid + 1;
+    }
+    entry.ids.splice(low, 0, id);
+  }
+
+  function removeMaintainedQueryId(entry: QueryCacheMaintainedQueryEntry, id: QueryCacheEntityId): void {
+    const index = entry.ids.indexOf(id);
+    if (index !== -1) entry.ids.splice(index, 1);
+  }
+
+  function compareMaintainedQueryValues(
+    entry: QueryCacheMaintainedQueryEntry,
+    left: JsonObject,
+    right: JsonObject,
+    leftId: QueryCacheEntityId,
+    rightId: QueryCacheEntityId
+  ): number {
+    const compared = entry.sort === undefined ? 0 : entry.sort(left, right, leftId, rightId);
+    if (Number.isFinite(compared) && compared !== 0) return compared;
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  }
+
   function refreshDependentQueries(
     ids: Set<QueryCacheEntityId>,
     skipHash?: string,
@@ -1121,6 +1589,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     }
     for (const hash of hashes) {
       if (hash === skipHash) continue;
+      if (maintainedQueries.has(hash)) continue;
       const entry = queries.get(hash);
       if (entry === undefined) continue;
       if (changedEntityFields !== undefined && !dependencyFieldsIntersect(entry.dependencyFields, changedEntityFields)) {
@@ -1140,6 +1609,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       entry.value = next;
       entry.updatedAt = now();
       entry.stale = false;
+      recordQueryCatchUp(entry, previousDependencies, ids);
       if (!hasQueryObservers(entry.hash)) continue;
       const patch = diff(previous, next);
       if (patch.length !== 0) queueQueryPatch(entry.hash, patch);
@@ -1202,8 +1672,205 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     entry.value = nextValue as JsonValue;
     entry.updatedAt = now();
     entry.stale = false;
+    recordQueryCatchUp(entry, entry.dependencies, changedIds);
     queueQueryPatch(entry.hash, [[OP_ARRAY_OBJECT_FIELD_ASSIGN, [], rowIndexes, fieldPaths, values] as PatchOperation]);
     return true;
+  }
+
+  function recordQueryCatchUp(
+    entry: QueryCacheEntry,
+    previousDependencies: Set<QueryCacheEntityId> | undefined,
+    changedEntities?: Set<QueryCacheEntityId>,
+    patch?: Patch
+  ): void {
+    const changedIds = new Set<QueryCacheEntityId>();
+    const removedIds: QueryCacheEntityId[] = [];
+    const changedQueryValue = patch !== undefined && patch.length !== 0;
+    const includeChangedEntities = patch === undefined || changedQueryValue;
+
+    if (previousDependencies === undefined) {
+      for (const id of entry.dependencies) changedIds.add(id);
+    } else {
+      for (const id of entry.dependencies) {
+        if (!previousDependencies.has(id)) changedIds.add(id);
+      }
+      for (const id of previousDependencies) {
+        if (!entry.dependencies.has(id)) removedIds[removedIds.length] = id;
+      }
+    }
+
+    if (includeChangedEntities && changedEntities !== undefined) {
+      for (const id of changedEntities) {
+        if (entry.dependencies.has(id)) changedIds.add(id);
+      }
+    }
+
+    if (changedIds.size === 0 && removedIds.length === 0) {
+      if (changedQueryValue) recordQueryCatchUpValue(entry, undefined, entry.value, false);
+      return;
+    }
+
+    for (const id of changedIds) {
+      const value = readQueryCatchUpEntityValue(entry, id);
+      if (value !== undefined) recordQueryCatchUpValue(entry, id, value, false);
+    }
+    for (let i = 0; i < removedIds.length; i++) {
+      recordQueryCatchUpValue(entry, removedIds[i], undefined, true);
+    }
+  }
+
+  function readQueryCatchUpEntityValue(entry: QueryCacheEntry, id: QueryCacheEntityId): JsonValue | undefined {
+    const projected = readQueryCatchUpProjectedValue(entry.root, id);
+    if (projected !== undefined) return projected;
+    const record = entities.get(id);
+    return record === undefined ? undefined : denormalizeValue(record, new Set()) as JsonValue;
+  }
+
+  function readQueryCatchUpProjectedValue(value: QueryCacheInternalValue, id: QueryCacheEntityId): JsonValue | undefined {
+    if (value === null || typeof value !== 'object') return undefined;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        const item = readQueryCatchUpProjectedValue(value[i], id);
+        if (item !== undefined) return item;
+      }
+      return undefined;
+    }
+    if (isReference(value)) {
+      return value[REF_KEY] === id ? denormalizeValue(value, new Set()) : undefined;
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) {
+      const item = readQueryCatchUpProjectedValue(value[keys[i]], id);
+      if (item !== undefined) return item;
+    }
+    return undefined;
+  }
+
+  function recordQueryCatchUpValue(
+    entry: QueryCacheEntry,
+    entityId: QueryCacheEntityId | undefined,
+    value: JsonValue | undefined,
+    removed: boolean
+  ): void {
+    const catchUp = ensureQueryCatchUp(entry);
+    const clock = nextCatchUpClock();
+    const record: QueryCacheCatchUpRecord = {
+      clock,
+      updatedAt: entry.updatedAt
+    };
+    if (entityId !== undefined) record.entityId = entityId;
+    if (value !== undefined) record.value = cloneJson(value);
+    if (removed) record.removed = true;
+    catchUp.records.set(entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : entityId, record);
+    catchUp.clock = clock;
+  }
+
+  function ensureQueryCatchUp(entry: QueryCacheEntry): QueryCacheCatchUpEntry {
+    let catchUp = queryCatchUps.get(entry.hash);
+    if (catchUp === undefined) {
+      catchUp = {
+        key: cloneJson(entry.key),
+        hash: entry.hash,
+        clock: 0,
+        records: new Map()
+      };
+      queryCatchUps.set(entry.hash, catchUp);
+    } else {
+      catchUp.key = cloneJson(entry.key);
+    }
+    return catchUp;
+  }
+
+  function nextCatchUpClock(): number {
+    catchUpClock++;
+    return catchUpClock;
+  }
+
+  function extractCatchUpSnapshot(): QueryCacheSnapshotCatchUpQuery[] {
+    const out: QueryCacheSnapshotCatchUpQuery[] = [];
+    for (const entry of queryCatchUps.values()) {
+      const changes = Array.from(entry.records.values())
+        .sort((left, right) => left.clock - right.clock)
+        .map((record) => cloneCatchUpRecord(record));
+      out[out.length] = {
+        key: cloneJson(entry.key),
+        hash: entry.hash,
+        clock: entry.clock,
+        changes
+      };
+    }
+    return out;
+  }
+
+  function restoreCatchUpSnapshot(snapshot: QueryCacheSnapshot): void {
+    const snapshotClock = readSnapshotClock(snapshot.catchUpClock);
+    const items = Array.isArray(snapshot.catchUp) ? snapshot.catchUp : [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item === null || typeof item !== 'object') continue;
+      const hash = typeof item.hash === 'string' ? item.hash : hashQueryKey(item.key);
+      const entry: QueryCacheCatchUpEntry = {
+        key: cloneJson(item.key),
+        hash,
+        clock: readSnapshotClock(item.clock),
+        records: new Map()
+      };
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      for (let changeIndex = 0; changeIndex < changes.length; changeIndex++) {
+        const change = changes[changeIndex];
+        if (change === null || typeof change !== 'object') continue;
+        const clock = readSnapshotClock(change.clock);
+        if (clock === 0) continue;
+        const record: QueryCacheCatchUpRecord = {
+          clock,
+          updatedAt: readSnapshotClock(change.updatedAt)
+        };
+        if (typeof change.entityId === 'string') record.entityId = change.entityId;
+        if (change.value !== undefined) record.value = cloneJson(change.value);
+        if (change.removed === true) record.removed = true;
+        entry.records.set(record.entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : record.entityId, record);
+        if (clock > entry.clock) entry.clock = clock;
+      }
+      queryCatchUps.set(hash, entry);
+      if (entry.clock > catchUpClock) catchUpClock = entry.clock;
+    }
+    if (snapshotClock > catchUpClock) catchUpClock = snapshotClock;
+  }
+
+  function seedCatchUpFromQueries(): void {
+    for (const entry of queries.values()) {
+      recordQueryCatchUp(entry, undefined, undefined, rootSetPatch(entry.value));
+    }
+  }
+
+  function cloneCatchUpRecord(record: QueryCacheCatchUpRecord): QueryCacheCatchUpChange {
+    const out: QueryCacheCatchUpChange = {
+      clock: record.clock,
+      updatedAt: record.updatedAt
+    };
+    if (record.entityId !== undefined) out.entityId = record.entityId;
+    if (record.value !== undefined) out.value = cloneJson(record.value);
+    if (record.removed === true) out.removed = true;
+    return out;
+  }
+
+  function normalizeCatchUpClock(value: number | undefined, name: string): number {
+    if (value === undefined) return 0;
+    const clock = Math.floor(value);
+    if (!Number.isFinite(clock) || clock < 0) throw new RangeError('query catch-up ' + name + ' must be a non-negative number');
+    return clock;
+  }
+
+  function normalizeCatchUpLimit(value: number | undefined): number | undefined {
+    if (value === undefined) return undefined;
+    const limit = Math.floor(value);
+    if (!Number.isFinite(limit) || limit < 0) throw new RangeError('query catch-up limit must be a non-negative number');
+    return limit;
+  }
+
+  function readSnapshotClock(value: unknown): number {
+    const clock = Math.floor(Number(value));
+    return Number.isFinite(clock) && clock > 0 ? clock : 0;
   }
 
   function queueQueryPatch(hash: string, patch: Patch): void {
@@ -1212,8 +1879,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const entry = queries.get(hash);
     if (batchDepth > 0) {
       const pending = pendingQueries.get(hash);
-      if (pending === undefined) pendingQueries.set(hash, { patch: clonePatch(patch) });
-      else pending.patch.push(...clonePatch(patch));
+      const queuedPatch = clonePatch(patch);
+      if (pending === undefined) pendingQueries.set(hash, { patch: queuedPatch });
+      else pending.patch.push(...queuedPatch);
       if (entry !== undefined) {
         pendingEvents.push({
           type: 'query',
@@ -1234,8 +1902,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     if (!hasEntityObservers(id)) return;
     if (batchDepth > 0) {
       const pending = pendingEntities.get(id);
-      if (pending === undefined) pendingEntities.set(id, { patch: clonePatch(patch) });
-      else pending.patch.push(...clonePatch(patch));
+      const queuedPatch = clonePatch(patch);
+      if (pending === undefined) pendingEntities.set(id, { patch: queuedPatch });
+      else pending.patch.push(...queuedPatch);
       pendingEvents.push({ type: 'entity', id, patch: clonePatch(patch) });
       return;
     }
@@ -1334,6 +2003,67 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     }
   }
 
+  function ensureDependencyNode(id: QueryCacheDependencyKey): QueryCacheDependencyNodeEntry {
+    let entry = dependencyNodes.get(id);
+    if (entry === undefined) {
+      entry = {
+        id,
+        dependencies: new Set(),
+        dependents: new Set()
+      };
+      dependencyNodes.set(id, entry);
+    }
+    return entry;
+  }
+
+  function normalizeDependencyKeys(
+    dependencies: readonly QueryCacheDependencyKey[] | undefined,
+    nodeId: QueryCacheDependencyKey
+  ): Set<QueryCacheDependencyKey> {
+    const out = new Set<QueryCacheDependencyKey>();
+    if (dependencies === undefined) return out;
+    if (!Array.isArray(dependencies)) throw new TypeError('dependency node dependencies must be an array');
+    for (let i = 0; i < dependencies.length; i++) {
+      const dependency = validateDependencyKey(dependencies[i], 'dependency key');
+      if (dependency === nodeId) throw new RangeError('dependency node cannot depend on itself');
+      out.add(dependency);
+    }
+    return out;
+  }
+
+  function validateDependencyKey(value: unknown, name: string): QueryCacheDependencyKey {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new TypeError(name + ' must be a non-empty string');
+    }
+    return value;
+  }
+
+  function wouldCreateDependencyCycle(
+    id: QueryCacheDependencyKey,
+    dependencies: Set<QueryCacheDependencyKey>
+  ): boolean {
+    for (const dependency of dependencies) {
+      if (dependencyReaches(dependency, id, new Set())) return true;
+    }
+    return false;
+  }
+
+  function dependencyReaches(
+    start: QueryCacheDependencyKey,
+    target: QueryCacheDependencyKey,
+    seen: Set<QueryCacheDependencyKey>
+  ): boolean {
+    if (start === target) return true;
+    if (seen.has(start)) return false;
+    seen.add(start);
+    const entry = dependencyNodes.get(start);
+    if (entry === undefined) return false;
+    for (const dependency of entry.dependencies) {
+      if (dependencyReaches(dependency, target, seen)) return true;
+    }
+    return false;
+  }
+
   function emitEvent(event: QueryCacheEvent): void {
     if (listeners.size === 0) return;
     const callbacks = Array.from(listeners);
@@ -1345,6 +2075,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     getQueryData,
     getQueryInfo,
     getQueryHash: hashQueryKey,
+    getQueryCatchUpClock,
+    readQueryCatchUp,
+    maintainQuery,
     watchQuery,
     watchEntity,
     subscribe,
@@ -1352,6 +2085,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     getEntity,
     modifyEntity,
     removeEntity,
+    setDependencyNode,
+    deleteDependencyNode,
+    invalidateDependency,
     invalidateQueries,
     invalidateEntity,
     batch,
@@ -1444,48 +2180,79 @@ export function persistQueryCache(
   if (typeof storage.save !== 'function') throw new TypeError('persistQueryCache storage.save must be a function');
 
   const debounceMs = Math.max(0, Math.floor(options.debounceMs || 0));
+  const appendChange = typeof storage.appendChange === 'function' && options.changeLog !== false
+    ? storage.appendChange.bind(storage)
+    : undefined;
+  const changeLogOptions = typeof options.changeLog === 'object' && options.changeLog !== null ? options.changeLog : {};
+  const includeChangeLogPatches = changeLogOptions.includePatches !== false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let muted = false;
   let disposed = false;
   let saving = false;
   let saveRequested = false;
-  let pending = false;
+  let hydrating = false;
+  let hydrated = false;
   let loads = 0;
   let saves = 0;
+  let changes = 0;
+  let changeLogWrites = 0;
+  let replayedChanges = 0;
+  let changeLogPending = 0;
+  let changeSeq = 0;
+  let changeLogFailure: unknown;
   let savePromise: Promise<void> = Promise.resolve();
+  let hydratePromise: Promise<boolean> | undefined;
+  let changeSeqPromise: Promise<void> | undefined;
+  let changeLogTail: Promise<void> = Promise.resolve();
 
-  const unsubscribe = cache.subscribe(() => {
+  const unsubscribe = cache.subscribe((event) => {
     if (muted || disposed) return;
+    enqueueChange(event);
     scheduleSave();
   });
 
-  async function hydrate(): Promise<boolean> {
-    if (disposed) return false;
+  function hydrate(): Promise<boolean> {
+    if (disposed) return Promise.resolve(false);
+    if (hydratePromise !== undefined) return hydratePromise;
+    hydratePromise = runHydrate();
+    return hydratePromise;
+  }
+
+  async function runHydrate(): Promise<boolean> {
+    hydrating = true;
     try {
       const snapshot = await storage.load();
       loads++;
-      if (snapshot === null || snapshot === undefined) return false;
+      const entries = await readReplayChangeLog();
+      if ((snapshot === null || snapshot === undefined) && entries.length === 0) return false;
       muted = true;
       try {
-        cache.restore(snapshot);
+        if (snapshot !== null && snapshot !== undefined) cache.restore(snapshot);
+        replayedChanges += await replayChangeLogEntries(entries);
       } finally {
         muted = false;
       }
+      hydrated = true;
       return true;
     } catch (error) {
       reportError(error);
       throw error;
+    } finally {
+      hydrating = false;
+      hydratePromise = undefined;
     }
   }
 
   async function flush(): Promise<void> {
     if (disposed) return;
     clearScheduledSave();
+    await flushChangeLog();
     await requestSave();
   }
 
   async function clear(): Promise<void> {
     clearScheduledSave();
+    await flushChangeLog();
     if (typeof storage.clear === 'function') {
       await storage.clear();
       return;
@@ -1502,7 +2269,17 @@ export function persistQueryCache(
   }
 
   function getStats(): QueryCachePersistenceStats {
-    return { loads, saves, pending, disposed };
+    return {
+      loads,
+      saves,
+      changes,
+      changeLogWrites,
+      replayedChanges,
+      pending: isPending(),
+      hydrating,
+      hydrated,
+      disposed
+    };
   }
 
   function scheduleSave(): void {
@@ -1511,7 +2288,6 @@ export function persistQueryCache(
       return;
     }
     clearScheduledSave();
-    pending = true;
     timer = setTimeout(() => {
       timer = undefined;
       void requestSave().catch(() => undefined);
@@ -1527,7 +2303,6 @@ export function persistQueryCache(
   function requestSave(): Promise<void> {
     if (disposed) return Promise.resolve();
     saveRequested = true;
-    pending = true;
     if (!saving) savePromise = runSaveLoop();
     return savePromise;
   }
@@ -1537,9 +2312,13 @@ export function persistQueryCache(
     try {
       while (saveRequested && !disposed) {
         saveRequested = false;
+        await flushChangeLog();
         const saveOwned = (storage as QueryCacheOwnedSnapshotStorage)[MEMORY_STORAGE_SAVE_OWNED];
-        if (saveOwned === undefined) {
-          await storage.save(cache.extract());
+        const snapshot = saveOwned === undefined || options.compactOnFlush === true ? cache.extract() : undefined;
+        if (options.compactOnFlush === true && typeof storage.compact === 'function') {
+          await storage.compact(snapshot || cache.extract());
+        } else if (saveOwned === undefined) {
+          await storage.save(snapshot || cache.extract());
         } else {
           const extractOwned = (cache as QueryCacheOwnedSnapshotSource)[QUERY_CACHE_EXTRACT_OWNED];
           await saveOwned.call(storage, extractOwned === undefined ? cache.extract() : extractOwned.call(cache));
@@ -1552,18 +2331,134 @@ export function persistQueryCache(
       throw error;
     } finally {
       saving = false;
-      pending = saveRequested || timer !== undefined;
       if (saveRequested && !disposed) savePromise = runSaveLoop();
     }
+  }
+
+  function enqueueChange(event: QueryCacheEvent): void {
+    changes++;
+    if (appendChange === undefined) return;
+    changeLogPending++;
+    const write = changeLogTail.then(async () => {
+      await ensureChangeSeq();
+      const entry = eventToChangeLogEntry(++changeSeq, event, includeChangeLogPatches);
+      await appendChange(entry);
+      changeLogWrites++;
+    });
+    changeLogTail = write.catch((error) => {
+      changeLogFailure = error;
+      reportError(error);
+    }).finally(() => {
+      changeLogPending--;
+    });
+    void changeLogTail.catch(() => undefined);
+  }
+
+  function ensureChangeSeq(): Promise<void> {
+    if (changeSeqPromise !== undefined) return changeSeqPromise;
+    if (typeof storage.readChangeLog !== 'function') {
+      changeSeqPromise = Promise.resolve();
+      return changeSeqPromise;
+    }
+    changeSeqPromise = Promise.resolve(storage.readChangeLog()).then((entries) => {
+      for (let i = 0; i < entries.length; i++) {
+        const seq = Number(entries[i].seq);
+        if (Number.isFinite(seq) && seq > changeSeq) changeSeq = Math.floor(seq);
+      }
+    });
+    return changeSeqPromise;
+  }
+
+  async function readReplayChangeLog(): Promise<QueryCacheChangeLogEntry[]> {
+    if (options.replayChangeLog !== true || typeof storage.readChangeLog !== 'function') return [];
+    const entries = await storage.readChangeLog();
+    const out = entries.map((entry) => cloneChangeLogEntry(entry));
+    out.sort((left, right) => left.seq - right.seq);
+    for (let i = 0; i < out.length; i++) {
+      const seq = Number(out[i].seq);
+      if (Number.isFinite(seq) && seq > changeSeq) changeSeq = Math.floor(seq);
+    }
+    return out;
+  }
+
+  async function replayChangeLogEntries(entries: readonly QueryCacheChangeLogEntry[]): Promise<number> {
+    let replayed = 0;
+    for (let i = 0; i < entries.length; i++) {
+      if (await replayChangeLogEntry(entries[i])) replayed++;
+    }
+    return replayed;
+  }
+
+  async function replayChangeLogEntry(entry: QueryCacheChangeLogEntry): Promise<boolean> {
+    if (entry.type === 'query') {
+      if (entry.key === undefined) throw new Error('Cannot replay query change-log entry without a query key');
+      if (entry.patch === undefined) throw new Error('Cannot replay query change-log entry without patch data');
+      const current = cache.getQueryData(entry.key);
+      const next = await applyReplayPatch(current === undefined ? null : current, entry.patch);
+      if (current !== undefined && equalsJsonFast(current, next)) return true;
+      cache.writeQuery(entry.key, next, {
+        updatedAt: Number.isFinite(entry.updatedAt) ? entry.updatedAt : undefined,
+        stale: entry.stale === true
+      });
+      return true;
+    }
+    if (entry.type === 'entity') {
+      if (entry.entityId === undefined) throw new Error('Cannot replay entity change-log entry without an entity id');
+      if (entry.patch === undefined) throw new Error('Cannot replay entity change-log entry without patch data');
+      const current = cache.getEntity(entry.entityId);
+      const next = await applyReplayPatch(current === undefined ? null : current, entry.patch);
+      if (next === null) {
+        cache.removeEntity(entry.entityId);
+        return true;
+      }
+      if (!isJsonObject(next)) throw new Error('Cannot replay entity change-log entry to a non-object value');
+      if (current !== undefined && equalsJsonFast(current, next)) return true;
+      cache.modifyEntity(entry.entityId, () => next);
+      return true;
+    }
+    if (entry.type === 'invalidate') {
+      if (entry.entityId !== undefined) {
+        cache.invalidateEntity(entry.entityId);
+        return true;
+      }
+      if (entry.key !== undefined) {
+        cache.invalidateQueries({ queryKey: entry.key, exact: true });
+        return true;
+      }
+      if (entry.hash !== undefined) {
+        cache.invalidateQueries({ predicate: (query) => query.hash === entry.hash });
+        return true;
+      }
+      return false;
+    }
+    if (entry.type === 'clear') {
+      cache.clear();
+      return true;
+    }
+    return false;
+  }
+
+  async function flushChangeLog(): Promise<void> {
+    await changeLogTail;
+    if (changeLogFailure !== undefined) {
+      const error = changeLogFailure;
+      changeLogFailure = undefined;
+      throw error;
+    }
+  }
+
+  function isPending(): boolean {
+    return timer !== undefined || saving || saveRequested || changeLogPending !== 0 || hydrating;
   }
 
   function reportError(error: unknown): void {
     if (typeof options.onError === 'function') options.onError(error);
   }
 
-  if (options.autoHydrate === true) void hydrate().catch(() => undefined);
+  const ready = options.autoHydrate === true ? hydrate() : Promise.resolve(false);
+  if (options.autoHydrate === true) void ready.catch(() => undefined);
 
-  return { hydrate, flush, clear, dispose, getStats };
+  return { ready, hydrate, flush, clear, dispose, getStats };
 }
 
 export function createQueryCacheChangeLog(
@@ -1795,6 +2690,14 @@ function cloneChangeLogEntry(entry: QueryCacheChangeLogEntry): QueryCacheChangeL
     stale: entry.stale,
     updatedAt: entry.updatedAt
   };
+}
+
+async function applyReplayPatch(value: JsonValue, patch: Patch): Promise<JsonValue> {
+  if (replayApplyPatchImmutable === undefined) {
+    replayApplyPatchImmutable = import('@shapeshift-labs/frontier/apply').then((module) => module.applyPatchImmutable as ReplayApplyPatchImmutable);
+  }
+  const applyPatch = await replayApplyPatchImmutable;
+  return applyPatch(value, patch);
 }
 
 function readCheckpointSeq(checkpoint: QueryCacheChangeLogCheckpoint | number | null | undefined): number {

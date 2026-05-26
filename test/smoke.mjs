@@ -5,7 +5,8 @@ import {
   hashQueryKey,
   mergeOffsetPage,
   mergeUniqueList,
-  partialMatchQueryKey
+  partialMatchQueryKey,
+  persistQueryCache
 } from '../dist/index.js';
 
 assert.strictEqual(
@@ -228,6 +229,291 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   });
   assert.ok(seenPaths.includes('wrapper/0'));
   assert.strictEqual(cache.getEntity('PathEntity:a').value, 1);
+}
+
+{
+  const cache = createQueryCache();
+  const source = ['todos', { source: 'scores' }];
+  const top = ['todos', { top: 2 }];
+  cache.writeQuery(source, [
+    { __typename: 'Todo', id: 't1', group: 'alpha', score: 10, revision: 0 },
+    { __typename: 'Todo', id: 't2', group: 'alpha', score: 8, revision: 0 },
+    { __typename: 'Todo', id: 't3', group: 'alpha', score: 4, revision: 0 },
+    { __typename: 'Todo', id: 't4', group: 'beta', score: 100, revision: 0 }
+  ]);
+  const maintained = cache.maintainQuery(top, {
+    filter: (entity) => entity.__typename === 'Todo' && entity.group === 'alpha',
+    sort: (left, right, leftId, rightId) => (
+      Number(right.score) - Number(left.score) || leftId.localeCompare(rightId)
+    ),
+    limit: 2,
+    select: (entity) => ({
+      __typename: 'Todo',
+      id: String(entity.id),
+      score: Number(entity.score),
+      revision: Number(entity.revision)
+    })
+  });
+  let observed = cache.getQueryData(top);
+  let callbacks = 0;
+  cache.watchQuery(top, (patch) => {
+    callbacks++;
+    observed = applyPatchImmutable(observed, patch);
+  });
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t1', 't2']);
+
+  cache.modifyEntity('Todo:t3', (todo) => ({ ...todo, score: 12, revision: Number(todo.revision) + 1 }));
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t3', 't1']);
+  assert.deepStrictEqual(observed, cache.getQueryData(top));
+
+  cache.modifyEntity('Todo:t1', (todo) => ({ ...todo, score: 1, revision: Number(todo.revision) + 1 }));
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t3', 't2']);
+
+  cache.optimistic('top-k', () => {
+    cache.modifyEntity('Todo:t2', (todo) => ({ ...todo, score: 30, revision: Number(todo.revision) + 1 }));
+  });
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t2', 't3']);
+  assert.strictEqual(cache.rollbackOptimistic('top-k'), true);
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t3', 't2']);
+  assert.ok(callbacks >= 3);
+
+  maintained.unsubscribe();
+  assert.strictEqual(maintained.active, false);
+  cache.modifyEntity('Todo:t4', (todo) => ({ ...todo, group: 'alpha', score: 200 }));
+  assert.deepStrictEqual(cache.getQueryData(top).map((todo) => todo.id), ['t3', 't2']);
+}
+
+{
+  const cache = createQueryCache({ now: () => 40 });
+  const changes = [];
+  const saves = [];
+  const storage = {
+    load() {
+      return null;
+    },
+    save(snapshot) {
+      saves.push(snapshot);
+    },
+    appendChange(entry) {
+      changes.push(entry);
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, { debounceMs: 1000 });
+
+  assert.strictEqual(await persistence.ready, false);
+  cache.writeQuery(['todo', 1], { __typename: 'Todo', id: '1', text: 'a', done: false });
+  cache.modifyEntity('Todo:1', (todo) => ({ ...todo, done: true }));
+  await persistence.flush();
+
+  assert.strictEqual(saves.length, 1);
+  assert.strictEqual(saves[0].queries[0].value.done, true);
+  assert.strictEqual(changes.length, 4);
+  assert.deepStrictEqual(changes.map((entry) => entry.seq), [1, 2, 3, 4]);
+  assert.strictEqual(persistence.getStats().changeLogWrites, 4);
+  persistence.dispose();
+}
+
+{
+  const cache = createQueryCache({ now: () => 45 });
+  const changes = [];
+  let reads = 0;
+  const storage = {
+    load() {
+      return null;
+    },
+    save() {},
+    readChangeLog() {
+      reads++;
+      return [{ seq: 7, type: 'clear' }];
+    },
+    appendChange(entry) {
+      changes.push(entry);
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, { debounceMs: 1000 });
+
+  cache.writeQuery(['todo', 1], { __typename: 'Todo', id: '1', text: 'a' });
+  await persistence.flush();
+
+  assert.strictEqual(reads, 1);
+  assert.deepStrictEqual(changes.map((entry) => entry.seq), [8, 9]);
+  persistence.dispose();
+}
+
+{
+  const cache = createQueryCache({ now: () => 47 });
+  const changes = [];
+  const storage = {
+    load() {
+      return null;
+    },
+    save() {},
+    appendChange(entry) {
+      changes.push(entry);
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, {
+    changeLog: { includePatches: false },
+    debounceMs: 1000
+  });
+
+  cache.writeQuery(['todo', 1], { __typename: 'Todo', id: '1', text: 'a' });
+  await persistence.flush();
+
+  assert.ok(changes.length > 0);
+  assert.ok(changes.every((entry) => entry.patch === undefined));
+  assert.ok(changes.some((entry) => entry.patchOperations > 0));
+  persistence.dispose();
+}
+
+{
+  const cache = createQueryCache();
+  let compacted = 0;
+  const storage = {
+    load() {
+      return null;
+    },
+    save() {
+      throw new Error('compactOnFlush should use compact when available');
+    },
+    compact(snapshot) {
+      compacted++;
+      assert.strictEqual(snapshot.queries[0].value.text, 'a');
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, {
+    compactOnFlush: true,
+    debounceMs: 1000
+  });
+
+  cache.writeQuery(['todo', 1], { __typename: 'Todo', id: '1', text: 'a' });
+  await persistence.flush();
+  assert.strictEqual(compacted, 1);
+  persistence.dispose();
+}
+
+{
+  const cache = createQueryCache();
+  const routeA = ['route', { id: 'a' }];
+  const routeB = ['route', { id: 'b' }];
+  const summary = ['routes', { view: 'summary' }];
+  cache.writeQuery(routeA, { route: 'a', eta: 12 });
+  cache.writeQuery(routeB, { route: 'b', eta: 20 });
+  cache.writeQuery(summary, { count: 2 });
+
+  const invalidations = [];
+  cache.subscribe((event) => {
+    if (event.type === 'invalidate') invalidations.push(event.hash);
+  });
+
+  cache.setDependencyNode({ id: 'segment:a', dependencies: ['edge:1'] });
+  cache.setDependencyNode({ id: 'route:a', dependencies: ['segment:a'], queryKey: routeA });
+  cache.setDependencyNode({ id: 'route:b', dependencies: ['edge:2'], queryKey: routeB });
+  cache.setDependencyNode({ id: 'routes:summary', dependencies: ['route:a', 'route:b'], queryKey: summary });
+
+  const first = cache.invalidateDependency('edge:1');
+  assert.deepStrictEqual(first, { dependencyKey: 'edge:1', visited: 4, invalidated: 2 });
+  assert.strictEqual(cache.getQueryInfo(routeA).stale, true);
+  assert.strictEqual(cache.getQueryInfo(summary).stale, true);
+  assert.strictEqual(cache.getQueryInfo(routeB).stale, false);
+  assert.strictEqual(invalidations.length, 2);
+
+  cache.writeQuery(routeA, { route: 'a', eta: 14 });
+  cache.writeQuery(summary, { count: 2 });
+  cache.setDependencyNode({ id: 'route:a', dependencies: ['edge:3'], queryKey: routeA });
+  const removed = cache.invalidateDependency('edge:1');
+  assert.deepStrictEqual(removed, { dependencyKey: 'edge:1', visited: 2, invalidated: 0 });
+
+  const moved = cache.invalidateDependency('edge:3');
+  assert.deepStrictEqual(moved, { dependencyKey: 'edge:3', visited: 3, invalidated: 2 });
+  assert.throws(
+    () => cache.setDependencyNode({ id: 'edge:3', dependencies: ['routes:summary'] }),
+    /cycle/
+  );
+
+  cache.writeQuery(routeA, { route: 'a', eta: 16 });
+  cache.writeQuery(summary, { count: 2 });
+  assert.strictEqual(cache.deleteDependencyNode('route:a'), true);
+  assert.deepStrictEqual(
+    cache.invalidateDependency('edge:3'),
+    { dependencyKey: 'edge:3', visited: 1, invalidated: 0 }
+  );
+  assert.strictEqual(cache.deleteDependencyNode('route:a'), false);
+  assert.deepStrictEqual(
+    cache.invalidateDependency('missing'),
+    { dependencyKey: 'missing', visited: 0, invalidated: 0 }
+  );
+}
+
+{
+  let tick = 0;
+  const cache = createQueryCache({ now: () => ++tick });
+  const key = ['todos', { catchUp: true }];
+  cache.writeQuery(key, [
+    { __typename: 'Todo', id: 'c1', text: 'first', done: false, revision: 0 },
+    { __typename: 'Todo', id: 'c2', text: 'second', done: false, revision: 0 }
+  ]);
+
+  const initial = cache.readQueryCatchUp(key);
+  assert.strictEqual(initial.complete, true);
+  assert.strictEqual(initial.changes.length, 2);
+  assert.deepStrictEqual(initial.changes.map((change) => change.entityId), ['Todo:c1', 'Todo:c2']);
+  assert.strictEqual(cache.getQueryCatchUpClock(key), initial.highWaterClock);
+
+  cache.modifyEntity('Todo:c2', (todo) => ({
+    ...todo,
+    text: 'second-updated',
+    revision: Number(todo.revision) + 1
+  }));
+  const update = cache.readQueryCatchUp(key, { lastSeenClock: initial.highWaterClock });
+  assert.strictEqual(update.complete, true);
+  assert.strictEqual(update.changes.length, 1);
+  assert.strictEqual(update.changes[0].entityId, 'Todo:c2');
+  assert.strictEqual(update.changes[0].value.text, 'second-updated');
+  assert.strictEqual(update.nextLastSeenClock, update.highWaterClock);
+
+  const limited = cache.readQueryCatchUp(key, { lastSeenClock: 0, limit: 1 });
+  assert.strictEqual(limited.complete, false);
+  assert.strictEqual(limited.changes.length, 1);
+  assert.strictEqual(limited.nextLastSeenClock, limited.changes[0].clock);
+
+  const snapshot = cache.extract();
+  const restored = createQueryCache();
+  restored.restore(snapshot);
+  const restoredUpdate = restored.readQueryCatchUp(key, { lastSeenClock: initial.highWaterClock });
+  assert.strictEqual(restoredUpdate.changes.length, 1);
+  assert.strictEqual(restoredUpdate.changes[0].entityId, 'Todo:c2');
+  assert.strictEqual(restoredUpdate.changes[0].value.text, 'second-updated');
+
+  const oldSnapshot = cache.extract();
+  delete oldSnapshot.catchUp;
+  delete oldSnapshot.catchUpClock;
+  const oldRestored = createQueryCache();
+  oldRestored.restore(oldSnapshot);
+  assert.strictEqual(oldRestored.readQueryCatchUp(key).changes.length, 2);
+}
+
+{
+  const cache = createQueryCache();
+  const source = ['todos', { catchUpSource: true }];
+  const open = ['todos', { catchUpOpen: true }];
+  cache.writeQuery(source, [
+    { __typename: 'Todo', id: 'm1', text: 'first', done: false },
+    { __typename: 'Todo', id: 'm2', text: 'second', done: false }
+  ]);
+  const maintained = cache.maintainQuery(open, {
+    filter: (entity) => entity.__typename === 'Todo' && entity.done === false,
+    sort: (left, right) => String(left.id).localeCompare(String(right.id))
+  });
+  const baseline = cache.getQueryCatchUpClock(open);
+
+  cache.modifyEntity('Todo:m1', (todo) => ({ ...todo, done: true }));
+  const removed = cache.readQueryCatchUp(open, { lastSeenClock: baseline });
+  assert.strictEqual(removed.changes.length, 1);
+  assert.strictEqual(removed.changes[0].entityId, 'Todo:m1');
+  assert.strictEqual(removed.changes[0].removed, true);
+
+  maintained.unsubscribe();
 }
 
 {

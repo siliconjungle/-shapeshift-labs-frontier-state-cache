@@ -106,7 +106,10 @@ import {
   mergeUniqueList,
   persistQueryCache,
   summarizeQueryCacheChanges,
-  type QueryCache
+  type QueryCache,
+  type QueryCacheCatchUpResult,
+  type QueryCacheDependencyNode,
+  type QueryCacheMaintainedQueryOptions
 } from '@shapeshift-labs/frontier-state-cache';
 ```
 
@@ -117,11 +120,86 @@ Core exports:
 - `cache.getQueryData(key)` reads the current denormalized query result.
 - `cache.modifyEntity(entity, updater)` updates one normalized entity and repairs dependent query snapshots.
 - `cache.removeEntity(entity)` removes one normalized entity, repairs dependent query snapshots, and emits the entity removal through the same deferred batch/change-log path as writes.
+- `cache.maintainQuery(key, options?)` keeps a derived query result repaired from normalized entities.
+- `cache.setDependencyNode(node)` and `cache.invalidateDependency(id)` track explicit producer-supplied dependency DAGs for derived query invalidation.
+- `cache.readQueryCatchUp(key, { lastSeenClock?, limit? })` reads per-query element changes newer than a subscriber's stored clock.
+- `cache.getQueryCatchUpClock(key)` returns the current high-water catch-up clock for a query.
 - `cache.watchQuery(key, callback)` subscribes to compact Frontier patches for one query.
 - `cache.watchEntity(entity, callback)` subscribes to compact Frontier patches for one entity.
 - `cache.invalidateQueries(filter?)` and `cache.invalidateEntity(entity)` mark affected queries stale.
 - `cache.optimistic(layerId, callback)`, `resolveOptimistic(layerId)`, and `rollbackOptimistic(layerId)` manage optimistic layers.
 - `cache.extract()` and `cache.restore(snapshot)` move cache state across storage boundaries.
+
+### Maintained Queries
+
+Use maintained queries for generic top-k, latest-N, filtered-list, or query-repair views that should update when normalized entities change:
+
+```js
+const topOpen = ['todos', { status: 'open', top: 10 }];
+
+const handle = cache.maintainQuery(topOpen, {
+  filter: (entity) => entity.__typename === 'Todo' && entity.status === 'open',
+  sort: (left, right, leftId, rightId) => (
+    Number(right.score) - Number(left.score) || leftId.localeCompare(rightId)
+  ),
+  limit: 10,
+  select: (entity) => ({
+    __typename: 'Todo',
+    id: entity.id,
+    score: entity.score,
+    title: entity.title
+  })
+});
+
+cache.modifyEntity('Todo:t1', (todo) => ({ ...todo, score: Number(todo.score) + 1 }));
+console.log(cache.getQueryData(topOpen));
+
+handle.unsubscribe();
+```
+
+### Subscription Catch-Up Clocks
+
+Use query catch-up clocks when a subscriber reconnects with a stored `lastSeenClock` and should receive only rows changed since that clock:
+
+```js
+const key = ['todos', { status: 'open' }];
+
+cache.writeQuery(key, [
+  { __typename: 'Todo', id: 't1', title: 'Ship', done: false }
+]);
+
+const first = cache.readQueryCatchUp(key);
+sendToClient(first.changes);
+
+cache.modifyEntity('Todo:t1', (todo) => ({ ...todo, done: true }));
+
+const next = cache.readQueryCatchUp(key, {
+  lastSeenClock: first.highWaterClock,
+  limit: 64
+});
+
+sendToClient(next.changes);
+storeClientClock(next.nextLastSeenClock);
+```
+
+Catch-up clocks are monotonically increasing server-side metadata outside the JSON value. Entity rows, maintained-query insertions, and maintained-query removals receive per-query clocks; scalar or aggregate query rewrites fall back to a full query-value catch-up record. `limit` responses set `complete: false` and advance `nextLastSeenClock` only to the last emitted change.
+
+### Dependency DAG Invalidation
+
+Use dependency nodes when an application already knows the footprint for a derived result, such as a route, compiler artifact, order-book slice, or dashboard aggregate. Frontier does not trace reads; producers supply stable dependency ids.
+
+```js
+const routeKey = ['route', { id: 'a' }];
+
+cache.writeQuery(routeKey, { id: 'a', eta: 12 });
+cache.setDependencyNode({ id: 'segment:a', dependencies: ['edge:1', 'traffic:1'] });
+cache.setDependencyNode({ id: 'route:a', dependencies: ['segment:a'], queryKey: routeKey });
+
+const result = cache.invalidateDependency('traffic:1');
+console.log(result.invalidated); // 1
+```
+
+`setDependencyNode()` rejects cycles, `deleteDependencyNode(id)` removes a node and its edges, and `invalidateDependency(id)` walks reverse edges to mark only reachable attached queries stale.
 
 ### Entity Identity
 
@@ -164,12 +242,23 @@ import {
 } from '@shapeshift-labs/frontier-state-cache';
 
 const storage = createQueryCacheMemoryStorageAdapter();
-const persistence = persistQueryCache(cache, storage, { debounceMs: 100 });
+const persistence = persistQueryCache(cache, storage, {
+  autoHydrate: true,
+  debounceMs: 100,
+  compactOnFlush: true,
+  replayChangeLog: true
+});
+
+await persistence.ready;
 await persistence.flush();
 
 const log = createQueryCacheChangeLog(cache, { capacity: 256 });
 const entries = log.readSince(log.checkpoint);
 ```
+
+`persistQueryCache()` owns hydrate/flush/debounce scheduling for the cache. The returned `persistence.ready` promise resolves the first auto-hydrate attempt. Storage adapters that expose `appendChange(entry)` also receive durable change-log entries automatically unless `changeLog: false` is passed; if they also expose `readChangeLog()`, persistence seeds new entries from the highest retained `seq` after a restart.
+
+Pass `replayChangeLog: true` to hydrate a stored snapshot and then apply retained post-checkpoint query/entity/invalidation entries from `readChangeLog()`. This is intentionally opt-in: adapters should pair it with `compactOnFlush: true` or an equivalent checkpoint policy so retained log entries represent changes after the loaded snapshot. Storage adapters that expose `compact(snapshot)` can be used with `compactOnFlush: true` to checkpoint a snapshot and trim adapter-owned logs during flush.
 
 ### Mutation Bridge
 
@@ -244,18 +333,24 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, default rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 15 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Write normalized query result | 129.02 us | 191.15 us |
-| Modify normalized entity | 8.25 us | 32.13 us |
-| Modify entity with query watchers | 8.54 us | 32.83 us |
-| Offset page merge write | 1.20 ms | 2.29 ms |
-| Memory persistence flush | 537.38 us | 2.21 ms |
-| Bounded change-log read | 0.29 us | 0.83 us |
-| Mutation bridge query commit | 3.11 ms | 10.69 ms |
-| Mutation bridge entity commit | 9.33 us | 15.08 us |
+| Write normalized query result | 123.01 us | 182.22 us |
+| Modify normalized entity | 9.21 us | 19.38 us |
+| Modify entity with query watchers | 8.92 us | 17.50 us |
+| Subscription catch-up read | 1.33 us | 2.17 us |
+| Top-k recompute scan | 85.75 us | 213.62 us |
+| Top-k maintained index | 11.25 us | 24.42 us |
+| Offset page merge write | 1.32 ms | 2.18 ms |
+| Dependency scan invalidate | 28.21 us | 42.04 us |
+| Dependency DAG invalidate | 1.58 us | 3.42 us |
+| Memory persistence flush | 1.60 ms | 2.10 ms |
+| Memory replay hydrate | 28.73 ms | 37.21 ms |
+| Bounded change-log read | 0.29 us | 0.58 us |
+| Mutation bridge query commit | 3.04 ms | 6.12 ms |
+| Mutation bridge entity commit | 9.71 us | 16.00 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 

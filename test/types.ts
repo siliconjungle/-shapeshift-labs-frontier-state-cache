@@ -6,6 +6,7 @@ import {
   mergeUniqueList,
   persistQueryCache,
   type QueryCache,
+  type QueryCacheCatchUpResult,
   type QueryCacheChangeLog,
   type QueryCacheSnapshot,
   type QueryCacheSubscription
@@ -33,6 +34,8 @@ const initial: JsonValue = [
 
 const patch: Patch = cache.writeQuery(key, initial);
 const value: JsonValue | undefined = cache.getQueryData(key);
+const catchUpClock: number = cache.getQueryCatchUpClock(key);
+const catchUp: QueryCacheCatchUpResult = cache.readQueryCatchUp(key, { lastSeenClock: catchUpClock, limit: 16 });
 const subscription: QueryCacheSubscription = cache.watchQuery(key, (queryPatch) => {
   const received: Patch = queryPatch;
   void received;
@@ -65,6 +68,7 @@ const entity: JsonObject | undefined = cache.getEntity('Todo:t1');
 const removePatch: Patch = cache.removeEntity('Todo:t1');
 
 void patch;
+void catchUp;
 void subscription;
 void compiled;
 void committed;

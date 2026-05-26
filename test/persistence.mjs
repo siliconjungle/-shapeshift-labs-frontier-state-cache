@@ -54,6 +54,63 @@ import {
 }
 
 {
+  let snapshot = null;
+  const changes = [];
+  const storage = {
+    load() {
+      return snapshot === null ? null : clone(snapshot);
+    },
+    save(next) {
+      snapshot = clone(next);
+    },
+    compact(next) {
+      snapshot = clone(next);
+      changes.length = 0;
+    },
+    appendChange(entry) {
+      changes.push(clone(entry));
+    },
+    readChangeLog() {
+      return changes.map(clone);
+    }
+  };
+  const source = createQueryCache({ now: () => 20 });
+  const sourcePersistence = persistQueryCache(source, storage, {
+    compactOnFlush: true,
+    debounceMs: 1000000
+  });
+
+  source.writeQuery(['todos'], [
+    { __typename: 'Todo', id: '1', text: 'ship', done: false, revision: 0 }
+  ]);
+  await sourcePersistence.flush();
+  assert.strictEqual(changes.length, 0);
+  const baselineWrites = sourcePersistence.getStats().changeLogWrites;
+
+  source.modifyEntity('Todo:1', (todo) => ({
+    ...todo,
+    done: true,
+    revision: Number(todo.revision) + 1
+  }));
+  await waitForChangeLogFlush(sourcePersistence, baselineWrites);
+  const replayChanges = storage.readChangeLog();
+  assert.ok(replayChanges.length > 0);
+  sourcePersistence.dispose();
+
+  const restored = createQueryCache({ now: () => 25 });
+  const restoredPersistence = persistQueryCache(restored, storage, {
+    replayChangeLog: true,
+    debounceMs: 1000000
+  });
+  assert.strictEqual(await restoredPersistence.hydrate(), true);
+  assert.deepStrictEqual(restored.getQueryData(['todos']), [
+    { __typename: 'Todo', id: '1', text: 'ship', done: true, revision: 1 }
+  ]);
+  assert.strictEqual(restoredPersistence.getStats().replayedChanges, replayChanges.length);
+  restoredPersistence.dispose();
+}
+
+{
   const cache = createQueryCache({ now: () => 30 });
   const log = createQueryCacheChangeLog(cache, { capacity: 4 });
 
@@ -82,6 +139,64 @@ import {
   log.ack(entries[0].seq);
   assert.strictEqual(log.readSince(0).length, 2);
   log.dispose();
+}
+
+{
+  let snapshot = null;
+  const changes = [];
+  const storage = {
+    load() {
+      return snapshot === null ? null : clone(snapshot);
+    },
+    save(next) {
+      snapshot = clone(next);
+    },
+    compact(next) {
+      snapshot = clone(next);
+      changes.length = 0;
+    },
+    appendChange(entry) {
+      changes.push(clone(entry));
+    },
+    readChangeLog() {
+      return changes.map(clone);
+    }
+  };
+  const source = createQueryCache({ now: () => 40 });
+  const sourcePersistence = persistQueryCache(source, storage, {
+    compactOnFlush: true,
+    debounceMs: 1000000
+  });
+
+  source.writeQuery(['todo', 'remove'], { __typename: 'Todo', id: 'remove', text: 'gone' });
+  await sourcePersistence.flush();
+  const baselineWrites = sourcePersistence.getStats().changeLogWrites;
+  source.removeEntity('Todo:remove');
+  await waitForChangeLogFlush(sourcePersistence, baselineWrites);
+  sourcePersistence.dispose();
+
+  const restored = createQueryCache({ now: () => 41 });
+  const restoredPersistence = persistQueryCache(restored, storage, {
+    replayChangeLog: true,
+    debounceMs: 1000000
+  });
+  assert.strictEqual(await restoredPersistence.hydrate(), true);
+  assert.strictEqual(restored.getEntity('Todo:remove'), undefined);
+  assert.strictEqual(restored.getQueryData(['todo', 'remove']), null);
+  restoredPersistence.dispose();
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function waitForChangeLogFlush(persistence, baselineWrites) {
+  for (let i = 0; i < 50; i++) {
+    const stats = persistence.getStats();
+    if (stats.changeLogWrites > baselineWrites && stats.changeLogWrites === stats.changes) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error('Timed out waiting for persistence change log flush');
 }
 
 console.log('frontier state-cache persistence passed');

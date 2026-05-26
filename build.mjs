@@ -8,6 +8,13 @@ const rootDir = path.resolve(packageDir, '..', '..');
 const packageJsonPath = path.join(packageDir, 'package.json');
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 const packageName = packageJson.name;
+const siblingRoot = path.dirname(packageDir);
+const standaloneDirNames = new Map([
+  ['@shapeshift-labs/frontier', 'frontier'],
+  ['@shapeshift-labs/frontier-codec', 'frontier-codec-standalone'],
+  ['@shapeshift-labs/frontier-mutation', 'frontier-mutation-standalone'],
+  ['@shapeshift-labs/frontier-query', 'frontier-query-standalone']
+]);
 const stack = new Set((process.env.FRONTIER_PACKAGE_BUILD_STACK || '').split(path.delimiter).filter(Boolean));
 const nextStack = new Set(stack);
 nextStack.add(packageName);
@@ -17,7 +24,7 @@ for (const dependency of readLocalDependencies(packageJson)) {
   const targetDir = localPackageDir(dependency);
   if (!targetDir || targetDir === packageDir) continue;
   linkLocalPackage(dependency, targetDir);
-  if (!stack.has(dependency)) {
+  if (!stack.has(dependency) && !isPackageBuildCurrent(targetDir)) {
     execFileSync('npm', ['--prefix', targetDir, 'run', 'build'], {
       stdio: 'inherit',
       env: {
@@ -28,7 +35,7 @@ for (const dependency of readLocalDependencies(packageJson)) {
   }
 }
 
-fs.rmSync(path.join(packageDir, 'dist'), { recursive: true, force: true });
+fs.rmSync(path.join(packageDir, 'dist'), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 execFileSync(resolveTsc(), ['-b', path.join(packageDir, 'tsconfig.json'), '--force'], { stdio: 'inherit' });
 
 function readLocalDependencies(pkg) {
@@ -45,8 +52,17 @@ function readLocalDependencies(pkg) {
 
 function localPackageDir(name) {
   const shortName = name.startsWith('@shapeshift-labs/') ? name.slice('@shapeshift-labs/'.length) : name;
-  const target = path.join(rootDir, 'packages', shortName);
-  return fs.existsSync(path.join(target, 'package.json')) ? target : null;
+  const standaloneName = standaloneDirNames.get(name);
+  const candidates = [
+    standaloneName ? path.join(siblingRoot, standaloneName) : null,
+    path.join(siblingRoot, shortName),
+    path.join(siblingRoot, 'json-diff', 'packages', shortName),
+    path.join(rootDir, 'packages', shortName)
+  ].filter(Boolean);
+  for (const target of candidates) {
+    if (fs.existsSync(path.join(target, 'package.json'))) return target;
+  }
+  return null;
 }
 
 function linkLocalPackage(name, targetDir) {
@@ -56,12 +72,35 @@ function linkLocalPackage(name, targetDir) {
   fs.mkdirSync(scopeDir, { recursive: true });
   try {
     const stat = fs.lstatSync(linkPath);
-    if (!stat.isSymbolicLink()) return;
-    fs.unlinkSync(linkPath);
+    if (stat.isSymbolicLink()) fs.unlinkSync(linkPath);
+    else fs.rmSync(linkPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
   fs.symlinkSync(path.relative(path.dirname(linkPath), targetDir), linkPath, 'dir');
+}
+
+function isPackageBuildCurrent(targetDir) {
+  const distEntry = path.join(targetDir, 'dist', 'index.js');
+  if (!fs.existsSync(distEntry)) return false;
+  const distMtime = fs.statSync(distEntry).mtimeMs;
+  for (const file of ['package.json', 'tsconfig.json', 'build.mjs']) {
+    const full = path.join(targetDir, file);
+    if (fs.existsSync(full) && fs.statSync(full).mtimeMs > distMtime) return false;
+  }
+  const srcDir = path.join(targetDir, 'src');
+  if (fs.existsSync(srcDir) && newestMtime(srcDir) > distMtime) return false;
+  return true;
+}
+
+function newestMtime(dir) {
+  let newest = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) newest = Math.max(newest, newestMtime(full));
+    else newest = Math.max(newest, fs.statSync(full).mtimeMs);
+  }
+  return newest;
 }
 
 function resolveTsc() {
