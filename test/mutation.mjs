@@ -2,9 +2,12 @@ import assert from 'node:assert';
 import { createMutationPlan, select } from '@shapeshift-labs/frontier-mutation';
 import { createQueryCache } from '../dist/index.js';
 import {
+  cacheMutationAccessesConflict,
   commitCacheEntityMutation,
   commitCacheQueryMutation,
-  compileCacheQueryMutation
+  compileCacheQueryMutation,
+  getCacheEntityMutationAccess,
+  getCacheQueryMutationAccess
 } from '../dist/mutation.js';
 
 const queryKey = ['todos', { status: 'open' }];
@@ -19,11 +22,21 @@ const plan = createMutationPlan()
     rows.increment('count', 1);
   });
 
-const compiled = compileCacheQueryMutation(cache, queryKey, plan);
+const compiled = compileCacheQueryMutation(cache, queryKey, plan, { access: true });
 assert.strictEqual(compiled.mutation.matched, 2);
+assert.strictEqual(compiled.access?.target, 'query');
+assert.strictEqual(compiled.access?.hash, cache.getQueryHash(queryKey));
 assert.deepStrictEqual(compiled.previous.map((todo) => todo.count), [1, 2]);
 assert.deepStrictEqual(compiled.next.map((todo) => todo.count), [2, 3]);
 assert.deepStrictEqual(cache.getQueryData(queryKey).map((todo) => todo.count), [1, 2]);
+assert.strictEqual(
+  cacheMutationAccessesConflict(compiled.access, getCacheQueryMutationAccess(queryKey, createMutationPlan().set('/0/count', 10))),
+  true
+);
+assert.strictEqual(
+  cacheMutationAccessesConflict(compiled.access, getCacheQueryMutationAccess(['todos', { status: 'closed' }], createMutationPlan().set('/0/count', 10))),
+  false
+);
 
 const committed = commitCacheQueryMutation(cache, queryKey, plan);
 assert.strictEqual(committed.mutation.matched, 2);
@@ -33,11 +46,20 @@ assert.deepStrictEqual(cache.getQueryData(queryKey).map((todo) => todo.count), [
 const entityPlan = createMutationPlan()
   .set('/done', true)
   .appendText('/text', ' now');
-const entityResult = commitCacheEntityMutation(cache, 'Todo:t1', entityPlan);
+const entityResult = commitCacheEntityMutation(cache, 'Todo:t1', entityPlan, { access: true });
 assert.strictEqual(entityResult.entityId, 'Todo:t1');
+assert.strictEqual(entityResult.access?.target, 'entity');
 assert.strictEqual(entityResult.previous.done, false);
 assert.strictEqual(entityResult.next.done, true);
 assert.ok(entityResult.cachePatch.length > 0);
+assert.strictEqual(
+  cacheMutationAccessesConflict(entityResult.access, getCacheEntityMutationAccess(cache, 'Todo:t1', createMutationPlan().set('/done', false))),
+  true
+);
+assert.strictEqual(
+  cacheMutationAccessesConflict(entityResult.access, getCacheEntityMutationAccess(cache, 'Todo:t2', createMutationPlan().set('/done', false))),
+  false
+);
 assert.deepStrictEqual(cache.getEntity('Todo:t1'), {
   __typename: 'Todo',
   id: 't1',

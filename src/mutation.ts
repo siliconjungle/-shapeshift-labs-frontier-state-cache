@@ -1,10 +1,16 @@
 import { cloneJson } from '@shapeshift-labs/frontier/clone';
 import { applyPatchImmutable } from '@shapeshift-labs/frontier/patch';
 import type { JsonObject, JsonValue, Patch } from '@shapeshift-labs/frontier/types';
-import { compileMutationPlan } from '@shapeshift-labs/frontier-mutation';
+import { hashQueryKey } from '@shapeshift-labs/frontier-query';
+import {
+  compileMutationPlan,
+  getMutationPlanAccess,
+  mutationAccessesConflict
+} from '@shapeshift-labs/frontier-mutation';
 import type {
   MutationCompileOptions,
   MutationCompileResult,
+  MutationPlanAccess,
   MutationPlanLike
 } from '@shapeshift-labs/frontier-mutation';
 import type {
@@ -19,6 +25,7 @@ export interface CacheMutationOptions {
   mutation?: MutationCompileOptions;
   missing?: 'throw' | 'empty';
   emptyValue?: JsonValue;
+  access?: boolean;
 }
 
 export interface CacheQueryMutationOptions extends CacheMutationOptions {
@@ -31,6 +38,7 @@ export interface CacheQueryMutationResult {
   next: JsonValue;
   patch: Patch;
   mutation: MutationCompileResult;
+  access?: CacheMutationAccess;
 }
 
 export interface CacheQueryMutationCommitResult extends CacheQueryMutationResult {
@@ -47,6 +55,18 @@ export interface CacheEntityMutationCommitResult {
   patch: Patch;
   cachePatch: Patch;
   mutation: MutationCompileResult;
+  access?: CacheMutationAccess;
+}
+
+export type CacheMutationAccessTarget = 'query' | 'entity';
+
+export interface CacheMutationAccess {
+  target: CacheMutationAccessTarget;
+  access: MutationPlanAccess;
+  key?: QueryCacheKey;
+  hash?: string;
+  entity?: QueryCacheEntityInput;
+  entityId?: QueryCacheEntityId | null;
 }
 
 export function compileCacheQueryMutation(
@@ -63,7 +83,8 @@ export function compileCacheQueryMutation(
     previous: cloneJson(previous),
     next,
     patch: mutation.patch,
-    mutation
+    mutation,
+    access: options.access === true ? getCacheQueryMutationAccess(key, plan) : undefined
   };
 }
 
@@ -106,8 +127,44 @@ export function commitCacheEntityMutation(
     next,
     patch: mutation.patch,
     cachePatch,
-    mutation
+    mutation,
+    access: options.access === true ? getCacheEntityMutationAccess(cache, entity, plan) : undefined
   };
+}
+
+export function getCacheQueryMutationAccess(key: QueryCacheKey, plan: MutationPlanLike): CacheMutationAccess {
+  return {
+    target: 'query',
+    key: cloneJson(key),
+    hash: hashQueryKey(key),
+    access: getMutationPlanAccess(plan)
+  };
+}
+
+export function getCacheEntityMutationAccess(
+  cache: QueryCache,
+  entity: QueryCacheEntityInput,
+  plan: MutationPlanLike
+): CacheMutationAccess {
+  return {
+    target: 'entity',
+    entity: cloneJson(entity as JsonValue) as QueryCacheEntityInput,
+    entityId: cache.identify(entity),
+    access: getMutationPlanAccess(plan)
+  };
+}
+
+export function cacheMutationAccessesConflict(left: CacheMutationAccess, right: CacheMutationAccess): boolean {
+  if (left.target === 'query' && right.target === 'query') {
+    return left.hash === right.hash && mutationAccessesConflict(left.access, right.access);
+  }
+  if (left.target === 'entity' && right.target === 'entity') {
+    return left.entityId !== null &&
+      right.entityId !== null &&
+      left.entityId === right.entityId &&
+      mutationAccessesConflict(left.access, right.access);
+  }
+  return true;
 }
 
 function readExistingQuery(cache: QueryCache, key: QueryCacheKey, options: CacheMutationOptions): JsonValue {

@@ -10,6 +10,9 @@ This package stores query results with normalized entities, query/entity watcher
 
 ## Related Packages
 
+- [`@shapeshift-labs/frontier-state-cache-idb`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-idb): IndexedDB persistence adapter for Frontier state-cache snapshots.
+- [`@shapeshift-labs/frontier-state-cache-file`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-file): Structured file persistence adapter for Frontier state-cache snapshots and change logs.
+- [`@shapeshift-labs/frontier-state-cache-sql`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-sql): SQL persistence adapter for Frontier state-cache snapshots and change logs.
 - [`@shapeshift-labs/frontier`](https://www.npmjs.com/package/@shapeshift-labs/frontier): core JSON diff/apply primitives used for watcher patches.
 - [`@shapeshift-labs/frontier-query`](https://www.npmjs.com/package/@shapeshift-labs/frontier-query): shared query-key, selector path, condition, identity, and table-schema primitives.
 - [`@shapeshift-labs/frontier-state`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state): app-state subscriptions and maintained views; related to cache but intentionally not a dependency.
@@ -22,6 +25,9 @@ This package stores query results with normalized entities, query/entity watcher
 
 Package source repositories:
 
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-idb`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb)
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-file`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-file)
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-sql`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-sql)
 - [`siliconjungle/-shapeshift-labs-frontier`](https://github.com/siliconjungle/-shapeshift-labs-frontier)
 - [`siliconjungle/-shapeshift-labs-frontier-query`](https://github.com/siliconjungle/-shapeshift-labs-frontier-query)
 - [`siliconjungle/-shapeshift-labs-frontier-state`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state)
@@ -89,6 +95,7 @@ Core exports:
 - `cache.writeQuery(key, data, options?)` stores a query result and normalizes identifiable entities.
 - `cache.getQueryData(key)` reads the current denormalized query result.
 - `cache.modifyEntity(entity, updater)` updates one normalized entity and repairs dependent query snapshots.
+- `cache.removeEntity(entity)` removes one normalized entity, repairs dependent query snapshots, and emits the entity removal through the same deferred batch/change-log path as writes.
 - `cache.watchQuery(key, callback)` subscribes to compact Frontier patches for one query.
 - `cache.watchEntity(entity, callback)` subscribes to compact Frontier patches for one entity.
 - `cache.invalidateQueries(filter?)` and `cache.invalidateEntity(entity)` mark affected queries stale.
@@ -149,17 +156,23 @@ The mutation bridge is isolated in an optional subpath so normal cache imports d
 
 ```js
 import { createMutationPlan, select } from '@shapeshift-labs/frontier-mutation';
-import { commitCacheQueryMutation } from '@shapeshift-labs/frontier-state-cache/mutation';
+import {
+  cacheMutationAccessesConflict,
+  commitCacheQueryMutation,
+  getCacheQueryMutationAccess
+} from '@shapeshift-labs/frontier-state-cache/mutation';
 
 const plan = createMutationPlan()
   .forEach(select('/*').where('done', '==', false).keyBy('id'), (rows) => {
     rows.set('done', true);
   });
 
-const result = commitCacheQueryMutation(cache, ['todos', { status: 'open' }], plan);
+const result = commitCacheQueryMutation(cache, ['todos', { status: 'open' }], plan, { access: true });
+const retryAccess = getCacheQueryMutationAccess(['todos', { status: 'open' }], plan);
 
 console.log(result.patch);      // mutation patch
 console.log(result.cachePatch); // cache watcher patch
+console.log(cacheMutationAccessesConflict(result.access, retryAccess));
 ```
 
 Mutation bridge exports:
@@ -167,6 +180,7 @@ Mutation bridge exports:
 - `compileCacheQueryMutation(cache, key, plan, options?)` compiles a plan against a cached query without committing it.
 - `commitCacheQueryMutation(cache, key, plan, options?)` writes the resulting query value back to the cache.
 - `commitCacheEntityMutation(cache, entity, plan, options?)` compiles and commits a plan against one normalized entity.
+- `getCacheQueryMutationAccess(...)`, `getCacheEntityMutationAccess(...)`, and `cacheMutationAccessesConflict(...)` expose opt-in read/write/effect metadata for optimistic safety and batching. Passing `{ access: true }` attaches the metadata to commit results.
 
 ## Subpath Imports
 

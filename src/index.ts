@@ -230,6 +230,7 @@ export interface QueryCache {
     entity: QueryCacheEntityInput,
     updater: (current: JsonObject | undefined) => JsonObject | null | undefined
   ): Patch;
+  removeEntity(entity: QueryCacheEntityInput): Patch;
   invalidateQueries(filter?: QueryCacheFilter): number;
   invalidateEntity(entity: QueryCacheEntityInput): number;
   batch<T>(callback: () => T): T;
@@ -273,8 +274,19 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   const pendingEvents: QueryCacheEvent[] = [];
   const trackIdentifyPath = typeof options.identify === 'function';
   let batchDepth = 0;
+  let sideEffectDepth = 0;
 
   function writeQuery(key: QueryCacheKey, data: JsonValue, writeOptions: QueryCacheWriteOptions = {}): Patch {
+    if (listeners.size === 0) return writeQueryNow(key, data, writeOptions);
+    enterDeferredSideEffects();
+    try {
+      return writeQueryNow(key, data, writeOptions);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function writeQueryNow(key: QueryCacheKey, data: JsonValue, writeOptions: QueryCacheWriteOptions): Patch {
     const hash = hashQueryKey(key);
     const previous = queries.get(hash);
     const incoming = writeOptions.merge
@@ -467,6 +479,19 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     entity: QueryCacheEntityInput,
     updater: (current: JsonObject | undefined) => JsonObject | null | undefined
   ): Patch {
+    if (listeners.size === 0) return modifyEntityNow(entity, updater);
+    enterDeferredSideEffects();
+    try {
+      return modifyEntityNow(entity, updater);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function modifyEntityNow(
+    entity: QueryCacheEntityInput,
+    updater: (current: JsonObject | undefined) => JsonObject | null | undefined
+  ): Patch {
     if (typeof updater !== 'function') throw new TypeError('modifyEntity updater must be a function');
     const id = identify(entity);
     if (id === null) throw new TypeError('modifyEntity could not identify entity');
@@ -499,7 +524,42 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     return clonePatch(entityPatch);
   }
 
+  function removeEntity(entity: QueryCacheEntityInput): Patch {
+    if (listeners.size === 0) return removeEntityNow(entity);
+    enterDeferredSideEffects();
+    try {
+      return removeEntityNow(entity);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function removeEntityNow(entity: QueryCacheEntityInput): Patch {
+    const id = identify(entity);
+    if (id === null) throw new TypeError('removeEntity could not identify entity');
+    const previousRecord = entities.get(id);
+    if (previousRecord === undefined) return [];
+    const previousValue = denormalizeValue(previousRecord, new Set()) as JsonValue;
+    entities.delete(id);
+    const changedEntities = new Set<QueryCacheEntityId>([id]);
+    const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>([[id, null]]);
+    const entityPatch = diff(previousValue, null);
+    if (entityPatch.length !== 0) queueEntityPatch(id, entityPatch);
+    refreshDependentQueries(changedEntities, undefined, changedEntityFields);
+    return clonePatch(entityPatch);
+  }
+
   function invalidateQueries(filter: QueryCacheFilter = {}): number {
+    if (listeners.size === 0) return invalidateQueriesNow(filter);
+    enterDeferredSideEffects();
+    try {
+      return invalidateQueriesNow(filter);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function invalidateQueriesNow(filter: QueryCacheFilter): number {
     let count = 0;
     for (const entry of queries.values()) {
       if (!matchesFilter(entry, filter)) continue;
@@ -513,6 +573,16 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   }
 
   function invalidateEntity(entity: QueryCacheEntityInput): number {
+    if (listeners.size === 0) return invalidateEntityNow(entity);
+    enterDeferredSideEffects();
+    try {
+      return invalidateEntityNow(entity);
+    } finally {
+      exitDeferredSideEffects();
+    }
+  }
+
+  function invalidateEntityNow(entity: QueryCacheEntityInput): number {
     const id = identify(entity);
     if (id === null) return 0;
     let count = 0;
@@ -543,6 +613,15 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       batchDepth--;
       if (batchDepth === 0) flushPending();
     }
+  }
+
+  function enterDeferredSideEffects(): void {
+    sideEffectDepth++;
+  }
+
+  function exitDeferredSideEffects(): void {
+    sideEffectDepth--;
+    if (sideEffectDepth === 0 && batchDepth === 0) flushPending();
   }
 
   function optimistic<T>(layerId: string, callback: () => T): T {
@@ -1129,7 +1208,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
 
   function queueQueryPatch(hash: string, patch: Patch): void {
     if (patch.length === 0) return;
-    if (batchDepth === 0 && !hasQueryObservers(hash)) return;
+    if (!hasQueryObservers(hash)) return;
     const entry = queries.get(hash);
     if (batchDepth > 0) {
       const pending = pendingQueries.get(hash);
@@ -1164,7 +1243,8 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   }
 
   function queueEvent(event: QueryCacheEvent): void {
-    if (batchDepth > 0) {
+    if (listeners.size === 0) return;
+    if (batchDepth !== 0 || sideEffectDepth !== 0) {
       pendingEvents[pendingEvents.length] = event;
       return;
     }
@@ -1191,7 +1271,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     if (!emitQueryEvent || listeners.size === 0) return;
     const entry = queries.get(hash);
     if (entry !== undefined) {
-      emitEvent({
+      queueEvent({
         type: 'query',
         key: cloneJson(entry.key),
         hash,
@@ -1208,7 +1288,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       const callbacks = Array.from(bucket);
       for (let i = 0; i < callbacks.length; i++) callbacks[i](clonePatch(patch));
     }
-    if (emitEntityEvent && listeners.size !== 0) emitEvent({ type: 'entity', id, patch: clonePatch(patch) });
+    if (emitEntityEvent && listeners.size !== 0) queueEvent({ type: 'entity', id, patch: clonePatch(patch) });
   }
 
   function hasEntityObservers(id: QueryCacheEntityId): boolean {
@@ -1271,6 +1351,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     identify,
     getEntity,
     modifyEntity,
+    removeEntity,
     invalidateQueries,
     invalidateEntity,
     batch,

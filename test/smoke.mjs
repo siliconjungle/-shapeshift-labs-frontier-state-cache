@@ -64,11 +64,18 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
     }
   });
   observed = cache.getQueryData(['viewer']);
+  const listenerSnapshots = [];
   cache.watchQuery(['viewer'], (patch) => {
     observed = applyPatchImmutable(observed, patch);
   });
   cache.subscribe((event) => {
-    if (event.type === 'query' || event.type === 'entity') eventCount++;
+    if (event.type === 'query' || event.type === 'entity') {
+      eventCount++;
+      listenerSnapshots.push({
+        observedDone: observed.viewer.todos[0].done,
+        cachedDone: cache.getQueryData(['viewer']).viewer.todos[0].done
+      });
+    }
   });
 
   const entityPatch = cache.modifyEntity('Todo:t1', (todo) => ({ ...todo, done: true }));
@@ -77,6 +84,8 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   assert.strictEqual(cache.getQueryData(['viewer']).viewer.todos[0].done, true);
   assert.strictEqual(cache.getEntity('Todo:t1').done, true);
   assert.ok(eventCount >= 1);
+  assert.ok(listenerSnapshots.length >= 1);
+  assert.ok(listenerSnapshots.every((snapshot) => snapshot.observedDone === true && snapshot.cachedDone === true));
 
   const invalidated = cache.invalidateEntity('Todo:t1');
   assert.strictEqual(invalidated, 1);
@@ -219,6 +228,52 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   });
   assert.ok(seenPaths.includes('wrapper/0'));
   assert.strictEqual(cache.getEntity('PathEntity:a').value, 1);
+}
+
+{
+  const cache = createQueryCache();
+  const query = ['todos', { removeEntity: true }];
+  cache.writeQuery(query, [
+    { __typename: 'Todo', id: 'r1', text: 'first', done: false },
+    { __typename: 'Todo', id: 'r2', text: 'second', done: false }
+  ]);
+  let observed = cache.getQueryData(query);
+  let observedEntity = cache.getEntity('Todo:r1');
+  let queryCallbacks = 0;
+  let entityCallbacks = 0;
+  cache.watchQuery(query, (patch) => {
+    queryCallbacks++;
+    observed = applyPatchImmutable(observed, patch);
+  });
+  cache.watchEntity('Todo:r1', (patch) => {
+    entityCallbacks++;
+    observedEntity = applyPatchImmutable(observedEntity, patch);
+  });
+
+  cache.batch(() => {
+    const removedPatch = cache.removeEntity('Todo:r1');
+    assert.ok(removedPatch.length > 0);
+    assert.strictEqual(cache.getEntity('Todo:r1'), undefined);
+    cache.modifyEntity('Todo:r1', () => ({
+      __typename: 'Todo',
+      id: 'r1',
+      text: 'recreated',
+      done: false
+    }));
+    assert.strictEqual(cache.getEntity('Todo:r1').text, 'recreated');
+    assert.strictEqual(queryCallbacks, 0);
+    assert.strictEqual(entityCallbacks, 0);
+  });
+
+  assert.strictEqual(cache.getQueryData(query)[0].text, 'recreated');
+  assert.strictEqual(observed[0].text, 'recreated');
+  assert.strictEqual(observedEntity.text, 'recreated');
+  assert.strictEqual(queryCallbacks, 1);
+  assert.strictEqual(entityCallbacks, 1);
+
+  cache.removeEntity('Todo:r1');
+  assert.strictEqual(cache.getEntity('Todo:r1'), undefined);
+  assert.strictEqual(cache.getQueryData(query)[0], null);
 }
 
 console.log('frontier state-cache smoke passed');

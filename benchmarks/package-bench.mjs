@@ -21,6 +21,7 @@ const iterations = readPositiveInt(args.iterations, 800);
 const results = [
   measureWriteQueries(rows, queries, rounds),
   measureEntityModify(rows, queries, iterations),
+  measureEntityRemove(iterations),
   measureWatchedEntityModify(rows, queries, iterations),
   measureOffsetMerge(rows, iterations),
   await measurePersistenceFlush(rows, queries, Math.max(40, Math.floor(iterations / 8))),
@@ -69,6 +70,20 @@ function measureEntityModify(rowCount, queryCount, runs) {
     samples.push((performance.now() - start) * 1000);
   }
   return summarize('modify normalized entity', samples, runs);
+}
+
+function measureEntityRemove(runs) {
+  const cache = createQueryCache();
+  cache.writeQuery(['todos', { remove: true }], makeTodos(0, runs + 32));
+  const samples = [];
+  let patchOps = 0;
+  for (let i = 0; i < runs; i++) {
+    const start = performance.now();
+    const patch = cache.removeEntity('Todo:' + i);
+    samples.push((performance.now() - start) * 1000);
+    patchOps += patch.length;
+  }
+  return summarize('remove normalized entity', samples, patchOps);
 }
 
 function measureWatchedEntityModify(rowCount, queryCount, runs) {
