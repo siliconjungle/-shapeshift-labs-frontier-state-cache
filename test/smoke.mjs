@@ -314,6 +314,43 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
 }
 
 {
+  const cache = createQueryCache({ now: () => 42 });
+  const saves = [];
+  const scheduled = [];
+  const scheduler = {
+    schedule(task) {
+      const existing = scheduled.findIndex((queued) => queued.key === task.key);
+      if (existing >= 0) {
+        scheduled[existing] = task;
+        return task;
+      }
+      scheduled.push(task);
+      return task;
+    },
+    run() {
+      while (scheduled.length !== 0) scheduled.shift().run();
+    }
+  };
+  const storage = {
+    load() {
+      return null;
+    },
+    save(snapshot) {
+      saves.push(snapshot);
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, { debounceMs: 0, scheduler });
+  assert.strictEqual(await persistence.ready, false);
+  cache.writeQuery(['scheduled'], { __typename: 'Todo', id: 's1', text: 'queued' });
+  assert.strictEqual(saves.length, 0);
+  assert.strictEqual(scheduled[0].type, 'frontier.state-cache.save');
+  scheduler.run();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.strictEqual(saves.length, 1);
+  persistence.dispose();
+}
+
+{
   const cache = createQueryCache({ now: () => 45 });
   const changes = [];
   let reads = 0;

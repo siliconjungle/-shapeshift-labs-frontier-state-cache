@@ -248,12 +248,35 @@ export interface QueryCachePersistenceChangeLogOptions {
   includePatches?: boolean;
 }
 
+export interface QueryCacheSchedulerTask {
+  id?: string;
+  type?: string;
+  lane?: string;
+  area?: string;
+  priority?: unknown;
+  units?: number;
+  key?: string;
+  metadata?: Record<string, unknown>;
+  run(context?: unknown): unknown;
+}
+
+export interface QueryCacheSchedulerLike {
+  schedule(task: QueryCacheSchedulerTask): unknown;
+  run?(options?: unknown): unknown;
+  requestRun?(options?: unknown): unknown;
+}
+
 export interface QueryCachePersistenceOptions {
   autoHydrate?: boolean;
   debounceMs?: number;
   changeLog?: boolean | QueryCachePersistenceChangeLogOptions;
   replayChangeLog?: boolean;
   compactOnFlush?: boolean;
+  scheduler?: QueryCacheSchedulerLike;
+  schedulerLane?: string;
+  schedulerPriority?: unknown;
+  schedulerAutoRun?: boolean;
+  schedulerRunOptions?: unknown;
   onError?: (error: unknown) => void;
 }
 
@@ -2185,6 +2208,10 @@ export function persistQueryCache(
     : undefined;
   const changeLogOptions = typeof options.changeLog === 'object' && options.changeLog !== null ? options.changeLog : {};
   const includeChangeLogPatches = changeLogOptions.includePatches !== false;
+  const scheduler = options.scheduler;
+  const schedulerLane = options.schedulerLane ?? 'cache';
+  const schedulerPriority = options.schedulerPriority ?? 'low';
+  const schedulerAutoRun = options.schedulerAutoRun ?? false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let muted = false;
   let disposed = false;
@@ -2199,6 +2226,7 @@ export function persistQueryCache(
   let replayedChanges = 0;
   let changeLogPending = 0;
   let changeSeq = 0;
+  let saveTaskSeq = 0;
   let changeLogFailure: unknown;
   let savePromise: Promise<void> = Promise.resolve();
   let hydratePromise: Promise<boolean> | undefined;
@@ -2284,14 +2312,38 @@ export function persistQueryCache(
 
   function scheduleSave(): void {
     if (debounceMs === 0) {
-      void requestSave().catch(() => undefined);
+      requestScheduledSave();
       return;
     }
     clearScheduledSave();
     timer = setTimeout(() => {
       timer = undefined;
-      void requestSave().catch(() => undefined);
+      requestScheduledSave();
     }, debounceMs);
+  }
+
+  function requestScheduledSave(): void {
+    if (scheduler === undefined) {
+      void requestSave().catch(() => undefined);
+      return;
+    }
+    scheduler.schedule({
+      id: 'frontier.state-cache.save:' + ++saveTaskSeq,
+      type: 'frontier.state-cache.save',
+      lane: schedulerLane,
+      area: 'cache',
+      priority: schedulerPriority,
+      units: 1,
+      key: 'frontier.state-cache.save',
+      metadata: { pendingChanges: changeLogPending },
+      run() {
+        void requestSave().catch(() => undefined);
+      }
+    });
+    if (schedulerAutoRun) {
+      if (typeof scheduler.requestRun === 'function') scheduler.requestRun(options.schedulerRunOptions);
+      else if (typeof scheduler.run === 'function') scheduler.run(options.schedulerRunOptions);
+    }
   }
 
   function clearScheduledSave(): void {

@@ -8,6 +8,7 @@ import {
   type QueryCache,
   type QueryCacheCatchUpResult,
   type QueryCacheChangeLog,
+  type QueryCacheSchedulerTask,
   type QueryCacheSnapshot,
   type QueryCacheSubscription
 } from '../dist/index.js';
@@ -62,7 +63,13 @@ const page: JsonValue = mergeOffsetPage(value, initial, { offset: 0 });
 const unique: JsonValue = mergeUniqueList(value, initial, { key: 'id' });
 const snapshot: QueryCacheSnapshot = cache.extract();
 const storage = createQueryCacheMemoryStorageAdapter();
-const persistence = persistQueryCache(cache, storage);
+const scheduler = {
+  schedule(task: QueryCacheSchedulerTask): unknown {
+    task.run();
+    return task;
+  }
+};
+const persistence = persistQueryCache(cache, storage, { scheduler, schedulerAutoRun: true });
 const log: QueryCacheChangeLog = createQueryCacheChangeLog(cache);
 const entity: JsonObject | undefined = cache.getEntity('Todo:t1');
 const removePatch: Patch = cache.removeEntity('Todo:t1');

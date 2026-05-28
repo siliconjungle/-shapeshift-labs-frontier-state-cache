@@ -22,8 +22,11 @@ The published Frontier package family is generated from one shared package catal
 - [`@shapeshift-labs/frontier-state-cache-sql`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-sql): SQL persistence adapter for Frontier state-cache snapshots and change logs.
 - [`@shapeshift-labs/frontier-schema`](https://www.npmjs.com/package/@shapeshift-labs/frontier-schema): JSON Schema validation, Frontier profile generation, CloudEvent envelopes, and query/table schema helpers.
 - [`@shapeshift-labs/frontier-event-log`](https://www.npmjs.com/package/@shapeshift-labs/frontier-event-log): Bounded event logs, replay cursors, consumer acknowledgements, keyed compaction, checkpoints, and Frontier patch event records.
+- [`@shapeshift-labs/frontier-scheduler`](https://www.npmjs.com/package/@shapeshift-labs/frontier-scheduler): Deterministic work scheduling, lanes, cancellation, backpressure, frame policies, replay snapshots, and work graphs.
 - [`@shapeshift-labs/frontier-logging`](https://www.npmjs.com/package/@shapeshift-labs/frontier-logging): Opt-in structured logging, browser telemetry, file sinks, exporters, benchmark traces, and Frontier patch/update summaries.
 - [`@shapeshift-labs/frontier-mutation`](https://www.npmjs.com/package/@shapeshift-labs/frontier-mutation): Explicit mutation and selector plans compiled to Frontier patches or CRDT operations.
+- [`@shapeshift-labs/frontier-virtual`](https://www.npmjs.com/package/@shapeshift-labs/frontier-virtual): DOM-neutral virtualization, layout providers, range materialization, grids, spatial culling, frustum culling, and serializable layout state.
+- [`@shapeshift-labs/frontier-dom`](https://www.npmjs.com/package/@shapeshift-labs/frontier-dom): Patch-native DOM and host renderer bindings, manifest hydration, JSX runtime/compiler helpers, SSR, devtools, and logging bridges.
 - [`@shapeshift-labs/frontier-crdt`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt): Native CRDT documents, update tooling, awareness, branches, conflict introspection, version frames, and undo.
 - [`@shapeshift-labs/frontier-crdt-sync`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt-sync): CRDT sync endpoints, repo/storage/provider contracts, document URLs, local networks, model checking, forensics, and text binding contracts.
 - [`@shapeshift-labs/frontier-crdt-websocket`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt-websocket): WebSocket client/server transports for Frontier CRDT sync providers.
@@ -47,8 +50,11 @@ Package source repositories:
 - [`siliconjungle/-shapeshift-labs-frontier-state-cache-sql`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-sql)
 - [`siliconjungle/-shapeshift-labs-frontier-schema`](https://github.com/siliconjungle/-shapeshift-labs-frontier-schema)
 - [`siliconjungle/-shapeshift-labs-frontier-event-log`](https://github.com/siliconjungle/-shapeshift-labs-frontier-event-log)
+- [`siliconjungle/-shapeshift-labs-frontier-scheduler`](https://github.com/siliconjungle/-shapeshift-labs-frontier-scheduler)
 - [`siliconjungle/-shapeshift-labs-frontier-logging`](https://github.com/siliconjungle/-shapeshift-labs-frontier-logging)
 - [`siliconjungle/-shapeshift-labs-frontier-mutation`](https://github.com/siliconjungle/-shapeshift-labs-frontier-mutation)
+- [`siliconjungle/-shapeshift-labs-frontier-virtual`](https://github.com/siliconjungle/-shapeshift-labs-frontier-virtual)
+- [`siliconjungle/-shapeshift-labs-frontier-dom`](https://github.com/siliconjungle/-shapeshift-labs-frontier-dom)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt-sync`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt-sync)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt-websocket`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt-websocket)
@@ -246,7 +252,8 @@ const persistence = persistQueryCache(cache, storage, {
   autoHydrate: true,
   debounceMs: 100,
   compactOnFlush: true,
-  replayChangeLog: true
+  replayChangeLog: true,
+  scheduler
 });
 
 await persistence.ready;
@@ -256,7 +263,7 @@ const log = createQueryCacheChangeLog(cache, { capacity: 256 });
 const entries = log.readSince(log.checkpoint);
 ```
 
-`persistQueryCache()` owns hydrate/flush/debounce scheduling for the cache. The returned `persistence.ready` promise resolves the first auto-hydrate attempt. Storage adapters that expose `appendChange(entry)` also receive durable change-log entries automatically unless `changeLog: false` is passed; if they also expose `readChangeLog()`, persistence seeds new entries from the highest retained `seq` after a restart.
+`persistQueryCache()` owns hydrate/flush/debounce scheduling for the cache. Pass a structural `scheduler` to route save work through a deterministic lane with backpressure; without one it falls back to the package-local debounce path. The returned `persistence.ready` promise resolves the first auto-hydrate attempt. Storage adapters that expose `appendChange(entry)` also receive durable change-log entries automatically unless `changeLog: false` is passed; if they also expose `readChangeLog()`, persistence seeds new entries from the highest retained `seq` after a restart.
 
 Pass `replayChangeLog: true` to hydrate a stored snapshot and then apply retained post-checkpoint query/entity/invalidation entries from `readChangeLog()`. This is intentionally opt-in: adapters should pair it with `compactOnFlush: true` or an equivalent checkpoint policy so retained log entries represent changes after the loaded snapshot. Storage adapters that expose `compact(snapshot)` can be used with `compactOnFlush: true` to checkpoint a snapshot and trim adapter-owned logs during flush.
 
@@ -333,24 +340,25 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 15 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 9 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Write normalized query result | 123.01 us | 182.22 us |
-| Modify normalized entity | 9.21 us | 19.38 us |
-| Modify entity with query watchers | 8.92 us | 17.50 us |
-| Subscription catch-up read | 1.33 us | 2.17 us |
-| Top-k recompute scan | 85.75 us | 213.62 us |
-| Top-k maintained index | 11.25 us | 24.42 us |
-| Offset page merge write | 1.32 ms | 2.18 ms |
-| Dependency scan invalidate | 28.21 us | 42.04 us |
-| Dependency DAG invalidate | 1.58 us | 3.42 us |
-| Memory persistence flush | 1.60 ms | 2.10 ms |
-| Memory replay hydrate | 28.73 ms | 37.21 ms |
-| Bounded change-log read | 0.29 us | 0.58 us |
-| Mutation bridge query commit | 3.04 ms | 6.12 ms |
-| Mutation bridge entity commit | 9.71 us | 16.00 us |
+| Write normalized query result | 272.93 us | 299.11 us |
+| Modify normalized entity | 11.33 us | 23.25 us |
+| Remove normalized entity | 445.79 us | 1.42 ms |
+| Modify entity with query watchers | 9.63 us | 16.37 us |
+| Subscription catch-up read | 1.21 us | 3.08 us |
+| Top-k recompute scan | 100.58 us | 308.50 us |
+| Top-k maintained index | 12.25 us | 53.46 us |
+| Offset page merge write | 1.36 ms | 2.57 ms |
+| Dependency scan invalidate | 28.62 us | 49.25 us |
+| Dependency DAG invalidate | 1.79 us | 4.50 us |
+| Memory persistence flush | 1.71 ms | 2.62 ms |
+| Memory replay hydrate | 31.15 ms | 39.44 ms |
+| Bounded change-log read | 0.29 us | 0.71 us |
+| Mutation bridge query commit | 5.57 ms | 7.27 ms |
+| Mutation bridge entity commit | 10.46 us | 20.79 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 
