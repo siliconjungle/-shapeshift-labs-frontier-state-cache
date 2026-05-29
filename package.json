@@ -57,7 +57,7 @@
     "mutation"
   ],
   "dependencies": {
-    "@shapeshift-labs/frontier": "0.1.8",
+    "@shapeshift-labs/frontier": "0.1.9",
     "@shapeshift-labs/frontier-query": "0.1.2"
   },
   "peerDependencies": {
