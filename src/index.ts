@@ -34,6 +34,7 @@ type QueryCacheInternalValue =
   | QueryCacheInternalArray
   | QueryCacheInternalObject;
 type QueryCacheDependencyFields = readonly string[] | Set<string> | null;
+const FIELD_ARRAY_CACHE_LIMIT = 4096;
 
 type QueryCacheEntry = {
   key: QueryCacheKey;
@@ -75,9 +76,11 @@ type QueryCacheCatchUpEntry = {
   hash: string;
   clock: number;
   records: Map<string, QueryCacheCatchUpRecord>;
+  recordsByClock: QueryCacheCatchUpRecord[];
 };
 
 type QueryCacheCatchUpRecord = {
+  recordKey: string;
   clock: number;
   updatedAt: number;
   entityId?: QueryCacheEntityId;
@@ -227,6 +230,380 @@ export interface QueryCacheSnapshotCatchUpQuery {
   changes: QueryCacheCatchUpChange[];
 }
 
+export type QueryCacheMergeQueueLaneStatus = 'open' | 'draining' | 'closed';
+export type QueryCacheMergeQueueTerminalDecisionStatus =
+  | 'applied'
+  | 'committed'
+  | 'queued'
+  | 'promoted'
+  | 'rejected'
+  | 'rerun'
+  | 'blocked'
+  | 'recorded';
+
+export interface QueryCacheMergeQueueActiveLeaseInput {
+  leaseId?: string;
+  lane?: string;
+  scopeId?: string;
+  workId?: string;
+  acquiredAt?: number;
+  expiresAt?: number | null;
+  updatedAt?: number;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueActiveLease {
+  leaseId: string;
+  lane: string;
+  scopeId?: string;
+  workId?: string;
+  acquiredAt: number;
+  expiresAt?: number;
+  updatedAt: number;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueQueuedWorkInput {
+  workId?: string;
+  lane?: string;
+  leaseId?: string;
+  scopeId?: string;
+  queuedAt?: number;
+  priority?: number | null;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueQueuedWork {
+  workId: string;
+  lane: string;
+  leaseId?: string;
+  scopeId?: string;
+  queuedAt: number;
+  priority?: number;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueLaneLifecycleInput {
+  lane?: string;
+  status?: QueryCacheMergeQueueLaneStatus;
+  openedAt?: number;
+  updatedAt?: number;
+  closedAt?: number | null;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueLaneLifecycle {
+  lane: string;
+  status: QueryCacheMergeQueueLaneStatus;
+  openedAt: number;
+  updatedAt: number;
+  closedAt?: number;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueTerminalDecisionInput {
+  decisionId?: string;
+  workId?: string;
+  lane?: string;
+  status?: QueryCacheMergeQueueTerminalDecisionStatus;
+  decidedAt?: number;
+  reason?: string;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueTerminalDecision {
+  decisionId: string;
+  workId: string;
+  lane: string;
+  status: QueryCacheMergeQueueTerminalDecisionStatus;
+  decidedAt: number;
+  reason?: string;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueOpenQuestionInput {
+  questionId?: string;
+  questionCode?: string;
+  openedAt?: number;
+  updatedAt?: number;
+  owner?: string;
+  surface?: string;
+  missingAuthority?: string;
+  question?: string;
+  answerCode?: string;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueOpenQuestion {
+  questionId: string;
+  openedAt: number;
+  updatedAt: number;
+  questionCode?: string;
+  owner?: string;
+  surface?: string;
+  missingAuthority?: string;
+  question?: string;
+  answerCode?: string;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueConsumedAnswerCursorInput {
+  questionId?: string;
+  questionCode?: string;
+  cursor?: string;
+  sequence?: number;
+  consumedAt?: number;
+  updatedAt?: number;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheMergeQueueConsumedAnswerCursor {
+  questionId: string;
+  cursor: string;
+  sequence: number;
+  consumedAt: number;
+  updatedAt: number;
+  questionCode?: string;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheSemanticStreamCursorInput {
+  streamId?: string;
+  cursor?: string;
+  sequence?: number;
+  updatedAt?: number;
+  metadata?: JsonObject | null;
+}
+
+export interface QueryCacheSemanticStreamCursor {
+  streamId: string;
+  cursor: string;
+  sequence: number;
+  updatedAt: number;
+  metadata?: JsonObject;
+}
+
+export interface QueryCacheMergeQueueSnapshotInput {
+  activeLeases?: readonly QueryCacheMergeQueueActiveLeaseInput[];
+  queuedWork?: readonly QueryCacheMergeQueueQueuedWorkInput[];
+  lanes?: readonly QueryCacheMergeQueueLaneLifecycleInput[];
+  terminalDecisions?: readonly QueryCacheMergeQueueTerminalDecisionInput[];
+  openQuestions?: readonly QueryCacheMergeQueueOpenQuestionInput[];
+  consumedAnswerCursors?: readonly QueryCacheMergeQueueConsumedAnswerCursorInput[];
+  semanticStreamCursor?: QueryCacheSemanticStreamCursorInput | null;
+}
+
+export interface QueryCacheMergeQueueSnapshot {
+  activeLeases: QueryCacheMergeQueueActiveLease[];
+  queuedWork: QueryCacheMergeQueueQueuedWork[];
+  lanes: QueryCacheMergeQueueLaneLifecycle[];
+  terminalDecisions: QueryCacheMergeQueueTerminalDecision[];
+  openQuestions: QueryCacheMergeQueueOpenQuestion[];
+  consumedAnswerCursors: QueryCacheMergeQueueConsumedAnswerCursor[];
+  semanticStreamCursor?: QueryCacheSemanticStreamCursor;
+}
+
+export function createQueryCacheMergeQueueActiveLease(input: QueryCacheMergeQueueActiveLeaseInput): QueryCacheMergeQueueActiveLease {
+  const leaseId = readMergeQueueString(input.leaseId, 'merge queue active lease leaseId');
+  const lane = readMergeQueueString(input.lane, 'merge queue active lease lane');
+  const acquiredAt = readMergeQueueClock(input.acquiredAt, 'merge queue active lease acquiredAt');
+  const out: QueryCacheMergeQueueActiveLease = {
+    leaseId,
+    lane,
+    acquiredAt,
+    updatedAt: readMergeQueueClock(input.updatedAt, 'merge queue active lease updatedAt', acquiredAt)
+  };
+  if (input.scopeId !== undefined) out.scopeId = readMergeQueueString(input.scopeId, 'merge queue active lease scopeId');
+  if (input.workId !== undefined) out.workId = readMergeQueueString(input.workId, 'merge queue active lease workId');
+  if (input.expiresAt !== undefined && input.expiresAt !== null) {
+    out.expiresAt = readMergeQueueClock(input.expiresAt, 'merge queue active lease expiresAt', acquiredAt);
+  }
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue active lease metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueQueuedWork(input: QueryCacheMergeQueueQueuedWorkInput): QueryCacheMergeQueueQueuedWork {
+  const workId = readMergeQueueString(input.workId, 'merge queue queued work workId');
+  const lane = readMergeQueueString(input.lane, 'merge queue queued work lane');
+  const out: QueryCacheMergeQueueQueuedWork = {
+    workId,
+    lane,
+    queuedAt: readMergeQueueClock(input.queuedAt, 'merge queue queued work queuedAt')
+  };
+  if (input.scopeId !== undefined) out.scopeId = readMergeQueueString(input.scopeId, 'merge queue queued work scopeId');
+  if (input.leaseId !== undefined) out.leaseId = readMergeQueueString(input.leaseId, 'merge queue queued work leaseId');
+  if (input.priority !== undefined && input.priority !== null) out.priority = readMergeQueueNumber(input.priority, 'merge queue queued work priority');
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue queued work metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueLaneLifecycle(input: QueryCacheMergeQueueLaneLifecycleInput): QueryCacheMergeQueueLaneLifecycle {
+  const lane = readMergeQueueString(input.lane, 'merge queue lane lifecycle lane');
+  const status = readMergeQueueLaneStatus(input.status);
+  const openedAt = readMergeQueueClock(input.openedAt, 'merge queue lane lifecycle openedAt');
+  const out: QueryCacheMergeQueueLaneLifecycle = {
+    lane,
+    status,
+    openedAt,
+    updatedAt: readMergeQueueClock(input.updatedAt, 'merge queue lane lifecycle updatedAt', openedAt)
+  };
+  if (input.closedAt !== undefined && input.closedAt !== null) {
+    out.closedAt = readMergeQueueClock(input.closedAt, 'merge queue lane lifecycle closedAt', openedAt);
+  }
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue lane lifecycle metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueTerminalDecision(
+  input: QueryCacheMergeQueueTerminalDecisionInput
+): QueryCacheMergeQueueTerminalDecision {
+  const decisionId = readMergeQueueString(input.decisionId, 'merge queue terminal decision decisionId');
+  const workId = readMergeQueueString(input.workId, 'merge queue terminal decision workId');
+  const lane = readMergeQueueString(input.lane, 'merge queue terminal decision lane');
+  const status = readMergeQueueTerminalDecisionStatus(input.status);
+  const decidedAt = readMergeQueueClock(input.decidedAt, 'merge queue terminal decision decidedAt');
+  const out: QueryCacheMergeQueueTerminalDecision = {
+    decisionId,
+    workId,
+    lane,
+    status,
+    decidedAt
+  };
+  if (input.reason !== undefined) out.reason = readMergeQueueString(input.reason, 'merge queue terminal decision reason');
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue terminal decision metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueOpenQuestion(
+  input: QueryCacheMergeQueueOpenQuestionInput
+): QueryCacheMergeQueueOpenQuestion {
+  const questionId = readMergeQueueString(input.questionId, 'merge queue open question questionId');
+  const openedAt = readMergeQueueClock(input.openedAt, 'merge queue open question openedAt');
+  const out: QueryCacheMergeQueueOpenQuestion = {
+    questionId,
+    openedAt,
+    updatedAt: readMergeQueueClock(input.updatedAt, 'merge queue open question updatedAt', openedAt)
+  };
+  if (input.questionCode !== undefined) out.questionCode = readMergeQueueString(input.questionCode, 'merge queue open question questionCode');
+  if (input.owner !== undefined) out.owner = readMergeQueueString(input.owner, 'merge queue open question owner');
+  if (input.surface !== undefined) out.surface = readMergeQueueString(input.surface, 'merge queue open question surface');
+  if (input.missingAuthority !== undefined) {
+    out.missingAuthority = readMergeQueueString(input.missingAuthority, 'merge queue open question missingAuthority');
+  }
+  if (input.question !== undefined) out.question = readMergeQueueString(input.question, 'merge queue open question question');
+  if (input.answerCode !== undefined) out.answerCode = readMergeQueueString(input.answerCode, 'merge queue open question answerCode');
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue open question metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueConsumedAnswerCursor(
+  input: QueryCacheMergeQueueConsumedAnswerCursorInput
+): QueryCacheMergeQueueConsumedAnswerCursor {
+  const questionId = readMergeQueueString(input.questionId, 'merge queue consumed answer cursor questionId');
+  const cursor = readMergeQueueString(input.cursor, 'merge queue consumed answer cursor cursor');
+  const sequence = readMergeQueueClock(input.sequence, 'merge queue consumed answer cursor sequence');
+  const consumedAt = readMergeQueueClock(input.consumedAt, 'merge queue consumed answer cursor consumedAt', sequence);
+  const out: QueryCacheMergeQueueConsumedAnswerCursor = {
+    questionId,
+    cursor,
+    sequence,
+    consumedAt,
+    updatedAt: readMergeQueueClock(input.updatedAt, 'merge queue consumed answer cursor updatedAt', consumedAt)
+  };
+  if (input.questionCode !== undefined) {
+    out.questionCode = readMergeQueueString(input.questionCode, 'merge queue consumed answer cursor questionCode');
+  }
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue consumed answer cursor metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheSemanticStreamCursor(
+  input: QueryCacheSemanticStreamCursorInput
+): QueryCacheSemanticStreamCursor {
+  const streamId = readMergeQueueString(input.streamId, 'merge queue semantic stream cursor streamId');
+  const cursor = readMergeQueueString(input.cursor, 'merge queue semantic stream cursor cursor');
+  const sequence = readMergeQueueClock(input.sequence, 'merge queue semantic stream cursor sequence');
+  const out: QueryCacheSemanticStreamCursor = {
+    streamId,
+    cursor,
+    sequence,
+    updatedAt: readMergeQueueClock(input.updatedAt, 'merge queue semantic stream cursor updatedAt', sequence)
+  };
+  if (input.metadata !== undefined && input.metadata !== null) {
+    out.metadata = cloneJson(readMergeQueueJsonObject(input.metadata, 'merge queue semantic stream cursor metadata'));
+  }
+  return out;
+}
+
+export function createQueryCacheMergeQueueSnapshot(
+  input: QueryCacheMergeQueueSnapshotInput = {}
+): QueryCacheMergeQueueSnapshot {
+  const activeLeases = sortQueryCacheMergeQueueActiveLeases((input.activeLeases ?? []).map(createQueryCacheMergeQueueActiveLease));
+  const queuedWork = sortQueryCacheMergeQueueQueuedWork((input.queuedWork ?? []).map(createQueryCacheMergeQueueQueuedWork));
+  const lanes = sortQueryCacheMergeQueueLanes((input.lanes ?? []).map(createQueryCacheMergeQueueLaneLifecycle));
+  const terminalDecisions = sortQueryCacheMergeQueueTerminalDecisions(
+    (input.terminalDecisions ?? []).map(createQueryCacheMergeQueueTerminalDecision)
+  );
+  const openQuestions = sortQueryCacheMergeQueueOpenQuestions((input.openQuestions ?? []).map(createQueryCacheMergeQueueOpenQuestion));
+  const consumedAnswerCursors = sortQueryCacheMergeQueueConsumedAnswerCursors(
+    (input.consumedAnswerCursors ?? []).map(createQueryCacheMergeQueueConsumedAnswerCursor)
+  );
+  const snapshot: QueryCacheMergeQueueSnapshot = {
+    activeLeases,
+    queuedWork,
+    lanes,
+    terminalDecisions,
+    openQuestions,
+    consumedAnswerCursors
+  };
+  if (input.semanticStreamCursor !== undefined && input.semanticStreamCursor !== null) {
+    snapshot.semanticStreamCursor = createQueryCacheSemanticStreamCursor(input.semanticStreamCursor);
+  }
+  return snapshot;
+}
+
+export function updateQueryCacheSemanticStreamCursor(
+  snapshot: QueryCacheMergeQueueSnapshot,
+  cursor: QueryCacheSemanticStreamCursorInput
+): QueryCacheMergeQueueSnapshot {
+  const next = createQueryCacheSemanticStreamCursor(cursor);
+  const out = createQueryCacheMergeQueueSnapshot(snapshot);
+  if (out.semanticStreamCursor === undefined || compareQueryCacheSemanticStreamCursor(next, out.semanticStreamCursor) > 0) {
+    out.semanticStreamCursor = next;
+  }
+  return out;
+}
+
+export function updateQueryCacheConsumedAnswerCursor(
+  snapshot: QueryCacheMergeQueueSnapshot,
+  cursor: QueryCacheMergeQueueConsumedAnswerCursorInput
+): QueryCacheMergeQueueSnapshot {
+  const next = createQueryCacheMergeQueueConsumedAnswerCursor(cursor);
+  const out = createQueryCacheMergeQueueSnapshot(snapshot);
+  const index = out.consumedAnswerCursors.findIndex((item) => item.questionId === next.questionId && item.cursor === next.cursor);
+  if (index === -1 || compareQueryCacheMergeQueueConsumedAnswerCursor(next, out.consumedAnswerCursors[index]) > 0) {
+    if (index === -1) {
+      out.consumedAnswerCursors[out.consumedAnswerCursors.length] = next;
+    } else {
+      out.consumedAnswerCursors[index] = next;
+    }
+    out.consumedAnswerCursors = sortQueryCacheMergeQueueConsumedAnswerCursors(out.consumedAnswerCursors);
+  }
+  return out;
+}
+
 export interface QueryCacheChangeLogStorageReadOptions {
   sinceSeq?: number;
   limit?: number;
@@ -266,6 +643,27 @@ export interface QueryCacheSchedulerLike {
   requestRun?(options?: unknown): unknown;
 }
 
+export type QueryCachePersistenceMigrationSource =
+  | 'frontier.state-cache.snapshot'
+  | 'frontier.state-cache.change-log';
+
+export interface QueryCachePersistenceMigrationContext {
+  readonly source: QueryCachePersistenceMigrationSource;
+  readonly storage: QueryCacheStorageAdapter;
+}
+
+export interface QueryCachePersistenceMigrationResult<T> {
+  readonly data: T | null | undefined;
+  readonly version?: string;
+  readonly changed?: boolean;
+  readonly report?: unknown;
+}
+
+export type QueryCachePersistenceMigrator<T> = (
+  data: T,
+  context: QueryCachePersistenceMigrationContext
+) => T | null | undefined | QueryCachePersistenceMigrationResult<T> | Promise<T | null | undefined | QueryCachePersistenceMigrationResult<T>>;
+
 export interface QueryCachePersistenceOptions {
   autoHydrate?: boolean;
   debounceMs?: number;
@@ -277,6 +675,9 @@ export interface QueryCachePersistenceOptions {
   schedulerPriority?: unknown;
   schedulerAutoRun?: boolean;
   schedulerRunOptions?: unknown;
+  migrateSnapshot?: QueryCachePersistenceMigrator<QueryCacheSnapshot>;
+  migrateChangeLogEntry?: QueryCachePersistenceMigrator<QueryCacheChangeLogEntry>;
+  onMigrationReport?: (report: unknown, context: QueryCachePersistenceMigrationContext) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -602,17 +1003,26 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const lastSeenClock = normalizeCatchUpClock(readOptions.lastSeenClock, 'lastSeenClock');
     const limit = normalizeCatchUpLimit(readOptions.limit);
     const highWaterClock = catchUp === undefined ? 0 : catchUp.clock;
-    const allChanges: QueryCacheCatchUpChange[] = [];
+    const changes: QueryCacheCatchUpChange[] = [];
+    let complete = true;
 
     if (catchUp !== undefined) {
-      for (const record of catchUp.records.values()) {
-        if (record.clock > lastSeenClock) allChanges[allChanges.length] = cloneCatchUpRecord(record);
+      const records = catchUp.recordsByClock;
+      for (
+        let i = findCatchUpClockIndex(records, lastSeenClock);
+        i < records.length;
+        i++
+      ) {
+        const record = records[i];
+        if (catchUp.records.get(record.recordKey) !== record) continue;
+        if (limit !== undefined && changes.length >= limit) {
+          complete = false;
+          break;
+        }
+        changes[changes.length] = cloneCatchUpRecord(record);
       }
-      allChanges.sort((left, right) => left.clock - right.clock);
     }
 
-    const complete = limit === undefined || allChanges.length <= limit;
-    const changes = limit === undefined ? allChanges : allChanges.slice(0, limit);
     const completedClock = highWaterClock > lastSeenClock ? highWaterClock : lastSeenClock;
     const nextLastSeenClock = changes.length === 0
       ? complete ? completedClock : lastSeenClock
@@ -794,11 +1204,10 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     if (id === null) throw new TypeError('removeEntity could not identify entity');
     const previousRecord = entities.get(id);
     if (previousRecord === undefined) return [];
-    const previousValue = denormalizeValue(previousRecord, new Set()) as JsonValue;
     entities.delete(id);
     const changedEntities = new Set<QueryCacheEntityId>([id]);
     const changedEntityFields = new Map<QueryCacheEntityId, Set<string> | null>([[id, null]]);
-    const entityPatch = diff(previousValue, null);
+    const entityPatch = rootSetPatch(null);
     if (entityPatch.length !== 0) queueEntityPatch(id, entityPatch);
     if (maintainedQueries.size !== 0) refreshMaintainedQueries(changedEntities);
     refreshDependentQueries(changedEntities, undefined, changedEntityFields);
@@ -1139,8 +1548,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     const object = normalizeObjectWithKeys(value, keys, dependencies, dependencyFields, changedEntities, changedEntityFields, path);
     const id = identify(value, path);
     if (id !== null) {
+      const fields = internFieldArray(keys);
       dependencies.add(id);
-      recordDependencyFields(dependencyFields, id, keys);
+      recordDependencyFields(dependencyFields, id, fields);
       const previous = entities.get(id);
       const merged = mergeEntityRecord(previous, object);
       const changed = previous === undefined || !equalsJsonFast(
@@ -1161,7 +1571,7 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
           queueEntityPatch(id, rootSetPatch(denormalizeValue(merged, new Set()) as JsonValue));
         }
       }
-      return createReference(id, keys);
+      return createReference(id, fields);
     }
     return object;
   }
@@ -1432,6 +1842,48 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     return true;
   }
 
+  const fieldArrayCache = new Map<string, string[]>();
+  let lastFieldArrayValue: string[] | undefined;
+  let secondLastFieldArrayValue: string[] | undefined;
+
+  function internFieldArray(fields: readonly string[]): string[] {
+    if (lastFieldArrayValue !== undefined && sameFieldArray(lastFieldArrayValue, fields)) {
+      return lastFieldArrayValue;
+    }
+    if (secondLastFieldArrayValue !== undefined && sameFieldArray(secondLastFieldArrayValue, fields)) {
+      const cached = secondLastFieldArrayValue;
+      secondLastFieldArrayValue = lastFieldArrayValue;
+      lastFieldArrayValue = cached;
+      return cached;
+    }
+    const cacheKey = fieldArrayKey(fields);
+    const cached = fieldArrayCache.get(cacheKey);
+    if (cached !== undefined) {
+      rememberFieldArray(cached);
+      return cached;
+    }
+    if (fieldArrayCache.size >= FIELD_ARRAY_CACHE_LIMIT) fieldArrayCache.clear();
+    const interned = fields.slice();
+    fieldArrayCache.set(cacheKey, interned);
+    rememberFieldArray(interned);
+    return interned;
+  }
+
+  function rememberFieldArray(fields: string[]): void {
+    if (lastFieldArrayValue === fields) return;
+    secondLastFieldArrayValue = lastFieldArrayValue;
+    lastFieldArrayValue = fields;
+  }
+
+  function fieldArrayKey(fields: readonly string[]): string {
+    let out = String(fields.length);
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i];
+      out += '|' + field.length + ':' + field;
+    }
+    return out;
+  }
+
   function mergeEntityRecord(
     previous: QueryCacheInternalObject | undefined,
     incoming: QueryCacheInternalObject
@@ -1449,14 +1901,20 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   ): Set<string> | null {
     if (previous === undefined) return null;
     const fields = new Set<string>();
-    const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
-    for (const key of keys) {
+    const previousKeys = Object.keys(previous);
+    for (let i = 0; i < previousKeys.length; i++) {
+      const key = previousKeys[i];
       if (!equalsJsonFast(
         previous[key] as unknown as JsonValue,
         next[key] as unknown as JsonValue
       )) {
         fields.add(key);
       }
+    }
+    const nextKeys = Object.keys(next);
+    for (let i = 0; i < nextKeys.length; i++) {
+      const key = nextKeys[i];
+      if (!Object.hasOwn(previous, key)) fields.add(key);
     }
     return fields;
   }
@@ -1618,6 +2076,9 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       if (changedEntityFields !== undefined && !dependencyFieldsIntersect(entry.dependencyFields, changedEntityFields)) {
         continue;
       }
+      if (changedEntityFields !== undefined && refreshRootArrayEntityRemoval(entry, ids, changedEntityFields)) {
+        continue;
+      }
       if (changedEntityFields !== undefined && refreshRootArrayEntityFields(entry, ids, changedEntityFields)) {
         continue;
       }
@@ -1637,6 +2098,39 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
       const patch = diff(previous, next);
       if (patch.length !== 0) queueQueryPatch(entry.hash, patch);
     }
+  }
+
+  function refreshRootArrayEntityRemoval(
+    entry: QueryCacheEntry,
+    changedIds: Set<QueryCacheEntityId>,
+    changedEntityFields: Map<QueryCacheEntityId, Set<string> | null>
+  ): boolean {
+    if (!Array.isArray(entry.root) || !Array.isArray(entry.value) || changedEntityFields.size !== 1) return false;
+    const iterator = changedEntityFields.entries().next();
+    if (iterator.done) return false;
+    const id = iterator.value[0];
+    if (!changedIds.has(id) || iterator.value[1] !== null) return false;
+    if (entities.has(id)) return false;
+    const rowIndexes: number[] = [];
+    for (let i = 0; i < entry.root.length; i++) {
+      const item = entry.root[i];
+      if (item !== null && typeof item === 'object' && !Array.isArray(item) && isReference(item) && item[REF_KEY] === id) {
+        rowIndexes[rowIndexes.length] = i;
+      }
+    }
+    if (rowIndexes.length === 0) return false;
+    const nextValue = entry.value.slice() as JsonValue[];
+    const values = new Array<JsonValue>(rowIndexes.length);
+    for (let i = 0; i < rowIndexes.length; i++) {
+      nextValue[rowIndexes[i]] = null;
+      values[i] = null;
+    }
+    entry.value = nextValue as JsonValue;
+    entry.updatedAt = now();
+    entry.stale = false;
+    recordQueryCatchUp(entry, entry.dependencies, changedIds);
+    queueQueryPatch(entry.hash, [[OP_ARRAY_ASSIGN, [], rowIndexes, values] as PatchOperation]);
+    return true;
   }
 
   function refreshRootArrayEntityFields(
@@ -1777,15 +2271,19 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   ): void {
     const catchUp = ensureQueryCatchUp(entry);
     const clock = nextCatchUpClock();
+    const recordKey = entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : entityId;
     const record: QueryCacheCatchUpRecord = {
+      recordKey,
       clock,
       updatedAt: entry.updatedAt
     };
     if (entityId !== undefined) record.entityId = entityId;
     if (value !== undefined) record.value = cloneJson(value);
     if (removed) record.removed = true;
-    catchUp.records.set(entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : entityId, record);
+    catchUp.records.set(recordKey, record);
+    catchUp.recordsByClock[catchUp.recordsByClock.length] = record;
     catchUp.clock = clock;
+    compactCatchUpEntryIfNeeded(catchUp);
   }
 
   function ensureQueryCatchUp(entry: QueryCacheEntry): QueryCacheCatchUpEntry {
@@ -1795,7 +2293,8 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
         key: cloneJson(entry.key),
         hash: entry.hash,
         clock: 0,
-        records: new Map()
+        records: new Map(),
+        recordsByClock: []
       };
       queryCatchUps.set(entry.hash, catchUp);
     } else {
@@ -1812,9 +2311,8 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
   function extractCatchUpSnapshot(): QueryCacheSnapshotCatchUpQuery[] {
     const out: QueryCacheSnapshotCatchUpQuery[] = [];
     for (const entry of queryCatchUps.values()) {
-      const changes = Array.from(entry.records.values())
-        .sort((left, right) => left.clock - right.clock)
-        .map((record) => cloneCatchUpRecord(record));
+      compactCatchUpEntry(entry);
+      const changes = entry.recordsByClock.map((record) => cloneCatchUpRecord(record));
       out[out.length] = {
         key: cloneJson(entry.key),
         hash: entry.hash,
@@ -1836,24 +2334,32 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
         key: cloneJson(item.key),
         hash,
         clock: readSnapshotClock(item.clock),
-        records: new Map()
+        records: new Map(),
+        recordsByClock: []
       };
-      const changes = Array.isArray(item.changes) ? item.changes : [];
+      const changes = Array.isArray(item.changes)
+        ? item.changes.slice().sort((left, right) => readSnapshotClock(left && left.clock) - readSnapshotClock(right && right.clock))
+        : [];
       for (let changeIndex = 0; changeIndex < changes.length; changeIndex++) {
         const change = changes[changeIndex];
         if (change === null || typeof change !== 'object') continue;
         const clock = readSnapshotClock(change.clock);
         if (clock === 0) continue;
+        const entityId = typeof change.entityId === 'string' ? change.entityId : undefined;
+        const recordKey = entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : entityId;
         const record: QueryCacheCatchUpRecord = {
+          recordKey,
           clock,
           updatedAt: readSnapshotClock(change.updatedAt)
         };
-        if (typeof change.entityId === 'string') record.entityId = change.entityId;
+        if (entityId !== undefined) record.entityId = entityId;
         if (change.value !== undefined) record.value = cloneJson(change.value);
         if (change.removed === true) record.removed = true;
-        entry.records.set(record.entityId === undefined ? QUERY_CATCH_UP_VALUE_KEY : record.entityId, record);
+        entry.records.set(recordKey, record);
+        entry.recordsByClock[entry.recordsByClock.length] = record;
         if (clock > entry.clock) entry.clock = clock;
       }
+      compactCatchUpEntry(entry);
       queryCatchUps.set(hash, entry);
       if (entry.clock > catchUpClock) catchUpClock = entry.clock;
     }
@@ -1875,6 +2381,35 @@ export function createQueryCache(options: QueryCacheOptions = {}): QueryCache {
     if (record.value !== undefined) out.value = cloneJson(record.value);
     if (record.removed === true) out.removed = true;
     return out;
+  }
+
+  function findCatchUpClockIndex(records: QueryCacheCatchUpRecord[], lastSeenClock: number): number {
+    let low = 0;
+    let high = records.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (records[mid].clock <= lastSeenClock) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  }
+
+  function compactCatchUpEntryIfNeeded(entry: QueryCacheCatchUpEntry): void {
+    const staleRecords = entry.recordsByClock.length - entry.records.size;
+    if (staleRecords <= 64 || staleRecords <= entry.records.size) return;
+    compactCatchUpEntry(entry);
+  }
+
+  function compactCatchUpEntry(entry: QueryCacheCatchUpEntry): void {
+    if (entry.recordsByClock.length === entry.records.size) return;
+    let write = 0;
+    const records = entry.recordsByClock;
+    for (let readIndex = 0; readIndex < records.length; readIndex++) {
+      const record = records[readIndex];
+      if (entry.records.get(record.recordKey) !== record) continue;
+      records[write++] = record;
+    }
+    records.length = write;
   }
 
   function normalizeCatchUpClock(value: number | undefined, name: string): number {
@@ -2192,6 +2727,14 @@ export function createQueryCacheMemoryStorageAdapter(initial: QueryCacheSnapshot
   return adapter;
 }
 
+export function getQueryCacheOwnedSnapshot(cache: QueryCache): QueryCacheSnapshot | undefined {
+  if (cache === null || typeof cache !== 'object') {
+    throw new TypeError('getQueryCacheOwnedSnapshot cache must be an object');
+  }
+  const owned = (cache as QueryCacheOwnedSnapshotSource)[QUERY_CACHE_EXTRACT_OWNED];
+  return owned === undefined ? undefined : owned.call(cache);
+}
+
 export function persistQueryCache(
   cache: QueryCache,
   storage: QueryCacheStorageAdapter,
@@ -2252,10 +2795,13 @@ export function persistQueryCache(
       const snapshot = await storage.load();
       loads++;
       const entries = await readReplayChangeLog();
-      if ((snapshot === null || snapshot === undefined) && entries.length === 0) return false;
+      const migratedSnapshot = snapshot === null || snapshot === undefined
+        ? snapshot
+        : await migratePersistenceSnapshot(snapshot);
+      if ((migratedSnapshot === null || migratedSnapshot === undefined) && entries.length === 0) return false;
       muted = true;
       try {
-        if (snapshot !== null && snapshot !== undefined) cache.restore(snapshot);
+        if (migratedSnapshot !== null && migratedSnapshot !== undefined) cache.restore(migratedSnapshot);
         replayedChanges += await replayChangeLogEntries(entries);
       } finally {
         muted = false;
@@ -2366,14 +2912,15 @@ export function persistQueryCache(
         saveRequested = false;
         await flushChangeLog();
         const saveOwned = (storage as QueryCacheOwnedSnapshotStorage)[MEMORY_STORAGE_SAVE_OWNED];
-        const snapshot = saveOwned === undefined || options.compactOnFlush === true ? cache.extract() : undefined;
+        const ownedSnapshot = (saveOwned !== undefined || options.compactOnFlush === true)
+          ? getQueryCacheOwnedSnapshot(cache)
+          : undefined;
         if (options.compactOnFlush === true && typeof storage.compact === 'function') {
-          await storage.compact(snapshot || cache.extract());
+          await storage.compact(ownedSnapshot ?? cache.extract());
         } else if (saveOwned === undefined) {
-          await storage.save(snapshot || cache.extract());
+          await storage.save(cache.extract());
         } else {
-          const extractOwned = (cache as QueryCacheOwnedSnapshotSource)[QUERY_CACHE_EXTRACT_OWNED];
-          await saveOwned.call(storage, extractOwned === undefined ? cache.extract() : extractOwned.call(cache));
+          await saveOwned.call(storage, ownedSnapshot ?? cache.extract());
         }
         saves++;
       }
@@ -2424,13 +2971,48 @@ export function persistQueryCache(
   async function readReplayChangeLog(): Promise<QueryCacheChangeLogEntry[]> {
     if (options.replayChangeLog !== true || typeof storage.readChangeLog !== 'function') return [];
     const entries = await storage.readChangeLog();
-    const out = entries.map((entry) => cloneChangeLogEntry(entry));
+    const out: QueryCacheChangeLogEntry[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const migrated = await migratePersistenceChangeLogEntry(cloneChangeLogEntry(entries[i]));
+      if (migrated !== null && migrated !== undefined) out.push(migrated);
+    }
     out.sort((left, right) => left.seq - right.seq);
     for (let i = 0; i < out.length; i++) {
       const seq = Number(out[i].seq);
       if (Number.isFinite(seq) && seq > changeSeq) changeSeq = Math.floor(seq);
     }
     return out;
+  }
+
+  async function migratePersistenceSnapshot(snapshot: QueryCacheSnapshot): Promise<QueryCacheSnapshot | null | undefined> {
+    if (!options.migrateSnapshot) return snapshot;
+    return normalizePersistenceMigrationResult(
+      await options.migrateSnapshot(snapshot, { source: 'frontier.state-cache.snapshot', storage }),
+      snapshot,
+      { source: 'frontier.state-cache.snapshot', storage }
+    );
+  }
+
+  async function migratePersistenceChangeLogEntry(entry: QueryCacheChangeLogEntry): Promise<QueryCacheChangeLogEntry | null | undefined> {
+    if (!options.migrateChangeLogEntry) return entry;
+    return normalizePersistenceMigrationResult(
+      await options.migrateChangeLogEntry(entry, { source: 'frontier.state-cache.change-log', storage }),
+      entry,
+      { source: 'frontier.state-cache.change-log', storage }
+    );
+  }
+
+  function normalizePersistenceMigrationResult<T>(
+    result: T | null | undefined | QueryCachePersistenceMigrationResult<T>,
+    fallback: T,
+    context: QueryCachePersistenceMigrationContext
+  ): T | null | undefined {
+    if (isPersistenceMigrationResult(result)) {
+      if (result.report !== undefined) options.onMigrationReport?.(result.report, context);
+      return result.data;
+    }
+    if (result === undefined) return fallback;
+    return result;
   }
 
   async function replayChangeLogEntries(entries: readonly QueryCacheChangeLogEntry[]): Promise<number> {
@@ -2790,10 +3372,177 @@ function isJsonObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function isPersistenceMigrationResult<T>(value: unknown): value is QueryCachePersistenceMigrationResult<T> {
+  if (value === null || typeof value !== 'object' || !('data' in value)) return false;
+  const candidate = value as { kind?: unknown; report?: unknown; version?: unknown; changed?: unknown };
+  return candidate.kind === 'frontier.migration.result'
+    || candidate.kind === 'frontier.migration.runtime-data.result'
+    || candidate.report !== undefined
+    || candidate.version !== undefined
+    || candidate.changed !== undefined;
+}
+
 function cloneInternalAsJson(value: QueryCacheInternalValue | unknown): JsonValue {
   return cloneJson(value as JsonValue);
 }
 
 function cloneInternalValue(value: unknown): QueryCacheInternalValue {
   return cloneJson(value as JsonValue) as QueryCacheInternalValue;
+}
+
+function readMergeQueueString(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(name + ' must be a non-empty string');
+  }
+  return value;
+}
+
+function readMergeQueueNumber(value: unknown, name: string): number {
+  const number = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(number)) throw new TypeError(name + ' must be a finite number');
+  return number;
+}
+
+function readMergeQueueClock(value: unknown, name: string, minimum = 0): number {
+  const clock = Math.floor(readMergeQueueNumber(value, name));
+  if (clock < minimum) throw new RangeError(name + ' must be greater than or equal to ' + minimum);
+  return clock;
+}
+
+function readMergeQueueJsonObject(value: JsonObject | null | undefined, name: string): JsonObject {
+  if (!isJsonObject(value)) throw new TypeError(name + ' must be a JSON object');
+  return value;
+}
+
+function readMergeQueueLaneStatus(value: unknown): QueryCacheMergeQueueLaneStatus {
+  if (value === 'open' || value === 'draining' || value === 'closed') return value;
+  throw new TypeError('merge queue lane lifecycle status must be open, draining, or closed');
+}
+
+function readMergeQueueTerminalDecisionStatus(value: unknown): QueryCacheMergeQueueTerminalDecisionStatus {
+  if (
+    value === 'applied'
+    || value === 'committed'
+    || value === 'queued'
+    || value === 'promoted'
+    || value === 'rejected'
+    || value === 'rerun'
+    || value === 'blocked'
+    || value === 'recorded'
+  ) return value;
+  throw new TypeError('merge queue terminal decision status must be a recognized status');
+}
+
+function sortQueryCacheMergeQueueActiveLeases(
+  records: QueryCacheMergeQueueActiveLease[]
+): QueryCacheMergeQueueActiveLease[] {
+  return records.sort((left, right) => (
+    compareMergeQueueStrings(left.leaseId, right.leaseId)
+    || compareMergeQueueStrings(left.lane, right.lane)
+    || compareMergeQueueStrings(left.scopeId, right.scopeId)
+    || compareMergeQueueStrings(left.workId, right.workId)
+    || compareMergeQueueNumbers(left.acquiredAt, right.acquiredAt)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+    || compareMergeQueueNumbers(left.expiresAt, right.expiresAt)
+  ));
+}
+
+function sortQueryCacheMergeQueueQueuedWork(
+  records: QueryCacheMergeQueueQueuedWork[]
+): QueryCacheMergeQueueQueuedWork[] {
+  return records.sort((left, right) => (
+    compareMergeQueueStrings(left.lane, right.lane)
+    || compareMergeQueueNumbers(left.queuedAt, right.queuedAt)
+    || compareMergeQueueStrings(left.workId, right.workId)
+    || compareMergeQueueStrings(left.scopeId, right.scopeId)
+    || compareMergeQueueStrings(left.leaseId, right.leaseId)
+    || compareMergeQueueNumbers(left.priority, right.priority)
+  ));
+}
+
+function sortQueryCacheMergeQueueLanes(
+  records: QueryCacheMergeQueueLaneLifecycle[]
+): QueryCacheMergeQueueLaneLifecycle[] {
+  return records.sort((left, right) => (
+    compareMergeQueueStrings(left.lane, right.lane)
+    || compareMergeQueueStrings(left.status, right.status)
+    || compareMergeQueueNumbers(left.openedAt, right.openedAt)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+    || compareMergeQueueNumbers(left.closedAt, right.closedAt)
+  ));
+}
+
+function sortQueryCacheMergeQueueTerminalDecisions(
+  records: QueryCacheMergeQueueTerminalDecision[]
+): QueryCacheMergeQueueTerminalDecision[] {
+  return records.sort((left, right) => (
+    compareMergeQueueNumbers(left.decidedAt, right.decidedAt)
+    || compareMergeQueueStrings(left.workId, right.workId)
+    || compareMergeQueueStrings(left.lane, right.lane)
+    || compareMergeQueueStrings(left.status, right.status)
+    || compareMergeQueueStrings(left.decisionId, right.decisionId)
+  ));
+}
+
+function sortQueryCacheMergeQueueOpenQuestions(
+  records: QueryCacheMergeQueueOpenQuestion[]
+): QueryCacheMergeQueueOpenQuestion[] {
+  return records.sort((left, right) => (
+    compareMergeQueueNumbers(left.openedAt, right.openedAt)
+    || compareMergeQueueStrings(left.questionCode, right.questionCode)
+    || compareMergeQueueStrings(left.questionId, right.questionId)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+  ));
+}
+
+function sortQueryCacheMergeQueueConsumedAnswerCursors(
+  records: QueryCacheMergeQueueConsumedAnswerCursor[]
+): QueryCacheMergeQueueConsumedAnswerCursor[] {
+  return records.sort((left, right) => (
+    compareMergeQueueStrings(left.questionId, right.questionId)
+    || compareMergeQueueStrings(left.questionCode, right.questionCode)
+    || compareMergeQueueNumbers(left.sequence, right.sequence)
+    || compareMergeQueueNumbers(left.consumedAt, right.consumedAt)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+    || compareMergeQueueStrings(left.cursor, right.cursor)
+  ));
+}
+
+function compareQueryCacheMergeQueueConsumedAnswerCursor(
+  left: QueryCacheMergeQueueConsumedAnswerCursor,
+  right: QueryCacheMergeQueueConsumedAnswerCursor
+): number {
+  return (
+    compareMergeQueueStrings(left.questionId, right.questionId)
+    || compareMergeQueueStrings(left.cursor, right.cursor)
+    || compareMergeQueueNumbers(left.sequence, right.sequence)
+    || compareMergeQueueNumbers(left.consumedAt, right.consumedAt)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+  );
+}
+
+function compareQueryCacheSemanticStreamCursor(
+  left: QueryCacheSemanticStreamCursor,
+  right: QueryCacheSemanticStreamCursor
+): number {
+  return (
+    compareMergeQueueStrings(left.streamId, right.streamId)
+    || compareMergeQueueNumbers(left.sequence, right.sequence)
+    || compareMergeQueueNumbers(left.updatedAt, right.updatedAt)
+    || compareMergeQueueStrings(left.cursor, right.cursor)
+  );
+}
+
+function compareMergeQueueStrings(left: string | undefined, right: string | undefined): number {
+  if (left === right) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+  return left.localeCompare(right);
+}
+
+function compareMergeQueueNumbers(left: number | undefined, right: number | undefined): number {
+  if (left === right) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+  return left - right;
 }

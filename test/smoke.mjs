@@ -2,11 +2,15 @@ import assert from 'node:assert';
 import { applyPatchImmutable } from '@shapeshift-labs/frontier/patch';
 import {
   createQueryCache,
+  createQueryCacheMergeQueueSnapshot,
+  getQueryCacheOwnedSnapshot,
   hashQueryKey,
   mergeOffsetPage,
   mergeUniqueList,
   partialMatchQueryKey,
-  persistQueryCache
+  persistQueryCache,
+  updateQueryCacheConsumedAnswerCursor,
+  updateQueryCacheSemanticStreamCursor
 } from '../dist/index.js';
 
 assert.strictEqual(
@@ -431,6 +435,47 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
 
 {
   const cache = createQueryCache();
+  let compactedSnapshot;
+  const storage = {
+    load() {
+      return null;
+    },
+    save() {
+      throw new Error('compactOnFlush should use compact when available');
+    },
+    compact(snapshot) {
+      compactedSnapshot = snapshot;
+    }
+  };
+  const persistence = persistQueryCache(cache, storage, {
+    compactOnFlush: true,
+    debounceMs: 1000
+  });
+
+  cache.writeQuery(['todo', 2], { __typename: 'Todo', id: '2', text: 'b' });
+  await persistence.flush();
+  assert.ok(compactedSnapshot);
+  compactedSnapshot.entities['Todo:2'].text = 'mutated';
+  assert.strictEqual(cache.getEntity('Todo:2').text, 'mutated');
+  persistence.dispose();
+}
+
+{
+  const cache = createQueryCache();
+  cache.writeQuery(['todo', 'owned'], { __typename: 'Todo', id: 'owned', text: 'compact' });
+
+  const ownedSnapshot = getQueryCacheOwnedSnapshot(cache);
+  assert.ok(ownedSnapshot);
+  ownedSnapshot.queries[0].value.text = 'mutated';
+  assert.strictEqual(cache.getQueryData(['todo', 'owned']).text, 'mutated');
+
+  const clonedSnapshot = cache.extract();
+  clonedSnapshot.queries[0].value.text = 'cloned';
+  assert.strictEqual(cache.getQueryData(['todo', 'owned']).text, 'mutated');
+}
+
+{
+  const cache = createQueryCache();
   const routeA = ['route', { id: 'a' }];
   const routeB = ['route', { id: 'b' }];
   const summary = ['routes', { view: 'summary' }];
@@ -509,6 +554,17 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   assert.strictEqual(update.changes[0].value.text, 'second-updated');
   assert.strictEqual(update.nextLastSeenClock, update.highWaterClock);
 
+  cache.modifyEntity('Todo:c2', (todo) => ({
+    ...todo,
+    text: 'second-updated-again',
+    revision: Number(todo.revision) + 1
+  }));
+  const repeated = cache.readQueryCatchUp(key, { lastSeenClock: initial.highWaterClock });
+  assert.strictEqual(repeated.complete, true);
+  assert.strictEqual(repeated.changes.length, 1);
+  assert.strictEqual(repeated.changes[0].entityId, 'Todo:c2');
+  assert.strictEqual(repeated.changes[0].value.text, 'second-updated-again');
+
   const limited = cache.readQueryCatchUp(key, { lastSeenClock: 0, limit: 1 });
   assert.strictEqual(limited.complete, false);
   assert.strictEqual(limited.changes.length, 1);
@@ -520,7 +576,7 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   const restoredUpdate = restored.readQueryCatchUp(key, { lastSeenClock: initial.highWaterClock });
   assert.strictEqual(restoredUpdate.changes.length, 1);
   assert.strictEqual(restoredUpdate.changes[0].entityId, 'Todo:c2');
-  assert.strictEqual(restoredUpdate.changes[0].value.text, 'second-updated');
+  assert.strictEqual(restoredUpdate.changes[0].value.text, 'second-updated-again');
 
   const oldSnapshot = cache.extract();
   delete oldSnapshot.catchUp;
@@ -597,6 +653,107 @@ assert.strictEqual(partialMatchQueryKey(['todos'], ['todos', { page: 1 }]), fals
   cache.removeEntity('Todo:r1');
   assert.strictEqual(cache.getEntity('Todo:r1'), undefined);
   assert.strictEqual(cache.getQueryData(query)[0], null);
+}
+
+{
+  const snapshot = createQueryCacheMergeQueueSnapshot({
+    activeLeases: [
+      { leaseId: 'lease-b', lane: 'lane-2', scopeId: 'scope-b', acquiredAt: 4, updatedAt: 5 },
+      { leaseId: 'lease-a', lane: 'lane-1', scopeId: 'scope-a', acquiredAt: 2, updatedAt: 3 }
+    ],
+    queuedWork: [
+      { workId: 'work-2', lane: 'lane-2', leaseId: 'lease-b', queuedAt: 8 },
+      { workId: 'work-1', lane: 'lane-1', leaseId: 'lease-a', queuedAt: 7 }
+    ],
+    lanes: [
+      { lane: 'lane-2', status: 'draining', openedAt: 2, updatedAt: 4 },
+      { lane: 'lane-1', status: 'open', openedAt: 1, updatedAt: 1 }
+    ],
+    terminalDecisions: [
+      { decisionId: 'decision-2', workId: 'work-2', lane: 'lane-2', status: 'rerun', decidedAt: 9 },
+      { decisionId: 'decision-1', workId: 'work-1', lane: 'lane-1', status: 'applied', decidedAt: 6 }
+    ],
+    openQuestions: [
+      {
+        questionId: 'question-2',
+        questionCode: 'question-code-2',
+        openedAt: 4,
+        updatedAt: 5,
+        owner: 'coordinator',
+        surface: 'packages/frontier-state-cache/test/smoke.mjs',
+        missingAuthority: 'approval',
+        question: 'Should the second question remain open?',
+        answerCode: 'approve|reject'
+      },
+      {
+        questionId: 'question-1',
+        questionCode: 'question-code-1',
+        openedAt: 2,
+        updatedAt: 3,
+        owner: 'maintainer',
+        surface: 'packages/frontier-state-cache/src/index.ts',
+        missingAuthority: 'policy',
+        question: 'Should the first question remain open?',
+        answerCode: 'choose:yes|no',
+        metadata: { group: 'alpha' }
+      }
+    ],
+    consumedAnswerCursors: [
+      {
+        questionId: 'question-2',
+        questionCode: 'question-code-2',
+        cursor: 'cursor-2',
+        sequence: 2,
+        consumedAt: 20,
+        updatedAt: 21
+      },
+      {
+        questionId: 'question-1',
+        questionCode: 'question-code-1',
+        cursor: 'cursor-1',
+        sequence: 1,
+        consumedAt: 10,
+        updatedAt: 11,
+        metadata: { route: 'continue' }
+      }
+    ],
+    semanticStreamCursor: {
+      streamId: 'semantic-stream',
+      cursor: 'cursor-2',
+      sequence: 2,
+      updatedAt: 20
+    }
+  });
+
+  assert.deepStrictEqual(snapshot.activeLeases.map((lease) => lease.leaseId), ['lease-a', 'lease-b']);
+  assert.deepStrictEqual(snapshot.queuedWork.map((work) => work.workId), ['work-1', 'work-2']);
+  assert.deepStrictEqual(snapshot.lanes.map((lane) => lane.lane), ['lane-1', 'lane-2']);
+  assert.deepStrictEqual(snapshot.terminalDecisions.map((decision) => decision.decisionId), ['decision-1', 'decision-2']);
+  assert.deepStrictEqual(snapshot.openQuestions.map((question) => question.questionId), ['question-1', 'question-2']);
+  assert.deepStrictEqual(snapshot.consumedAnswerCursors.map((cursor) => cursor.questionId), ['question-1', 'question-2']);
+  assert.strictEqual(snapshot.openQuestions[0].metadata.group, 'alpha');
+  assert.strictEqual(snapshot.consumedAnswerCursors[0].metadata.route, 'continue');
+  assert.strictEqual(snapshot.semanticStreamCursor.cursor, 'cursor-2');
+
+  const staleCursor = updateQueryCacheConsumedAnswerCursor(snapshot, {
+    questionId: 'question-1',
+    questionCode: 'question-code-1',
+    cursor: 'cursor-1',
+    sequence: 0,
+    consumedAt: 30,
+    updatedAt: 40
+  });
+  assert.strictEqual(staleCursor.consumedAnswerCursors[0].sequence, 1);
+  assert.strictEqual(staleCursor.consumedAnswerCursors[0].consumedAt, 10);
+
+  const stale = updateQueryCacheSemanticStreamCursor(snapshot, {
+    streamId: 'semantic-stream',
+    cursor: 'cursor-stale',
+    sequence: 1,
+    updatedAt: 30
+  });
+  assert.strictEqual(stale.semanticStreamCursor.cursor, 'cursor-2');
+  assert.deepStrictEqual(stale.terminalDecisions.map((decision) => decision.decisionId), ['decision-1', 'decision-2']);
 }
 
 console.log('frontier state-cache smoke passed');

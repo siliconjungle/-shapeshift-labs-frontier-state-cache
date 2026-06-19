@@ -54,6 +54,43 @@ import {
 }
 
 {
+  const storage = createQueryCacheMemoryStorageAdapter();
+  storage.save({
+    metadata: { dataVersion: '1' },
+    entities: {
+      'Todo:1': { __typename: 'Todo', id: '1', text: 'old' }
+    },
+    queries: []
+  });
+  let report;
+  const cache = createQueryCache();
+  const persistence = persistQueryCache(cache, storage, {
+    migrateSnapshot(snapshot) {
+      return {
+        kind: 'frontier.migration.runtime-data.result',
+        data: {
+          ...snapshot,
+          metadata: { dataVersion: '2' },
+          entities: {
+            'Todo:1': { __typename: 'Todo', id: '1', title: snapshot.entities['Todo:1'].text }
+          }
+        },
+        version: '2',
+        changed: true,
+        report: { kind: 'frontier.migration.report', source: 'idb:query-cache' }
+      };
+    },
+    onMigrationReport(nextReport) {
+      report = nextReport;
+    }
+  });
+  assert.strictEqual(await persistence.hydrate(), true);
+  assert.deepStrictEqual(cache.getEntity('Todo:1'), { __typename: 'Todo', id: '1', title: 'old' });
+  assert.deepStrictEqual(report, { kind: 'frontier.migration.report', source: 'idb:query-cache' });
+  persistence.dispose();
+}
+
+{
   let snapshot = null;
   const changes = [];
   const storage = {

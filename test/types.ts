@@ -69,7 +69,26 @@ const scheduler = {
     return task;
   }
 };
-const persistence = persistQueryCache(cache, storage, { scheduler, schedulerAutoRun: true });
+const persistence = persistQueryCache(cache, storage, {
+  scheduler,
+  schedulerAutoRun: true,
+  migrateSnapshot(snapshot, context) {
+    const source: string = context.source;
+    void source;
+    return {
+      data: snapshot,
+      version: '2',
+      changed: false,
+      report: { source: 'types' }
+    };
+  },
+  migrateChangeLogEntry(entry) {
+    return entry;
+  },
+  onMigrationReport(report: unknown) {
+    void report;
+  }
+});
 const log: QueryCacheChangeLog = createQueryCacheChangeLog(cache);
 const entity: JsonObject | undefined = cache.getEntity('Todo:t1');
 const removePatch: Patch = cache.removeEntity('Todo:t1');

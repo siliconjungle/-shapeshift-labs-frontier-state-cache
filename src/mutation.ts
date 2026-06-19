@@ -19,7 +19,7 @@ import type {
   QueryCacheEntityInput,
   QueryCacheKey,
   QueryCacheWriteOptions
-} from './index.js';
+} from './index.ts';
 
 export interface CacheMutationOptions {
   mutation?: MutationCompileOptions;
